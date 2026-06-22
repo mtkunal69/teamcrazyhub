@@ -977,8 +977,8 @@ async def telegram_webhook(request: Request):
         if chat_id and user_id and link_url:
             link = await db.invite_links.find_one({"link_url": link_url})
             if link:
-                # Record member entry (idempotent)
-                await db.link_members.update_one(
+                # Record member entry (idempotent on (link_id, telegram_user_id))
+                res = await db.link_members.update_one(
                     {"link_id": link["id"], "telegram_user_id": user_id},
                     {"$set": {
                         "link_id": link["id"],
@@ -991,13 +991,17 @@ async def telegram_webhook(request: Request):
                     }},
                     upsert=True,
                 )
-                await db.invite_links.update_one(
-                    {"id": link["id"]},
-                    {"$inc": {"members_joined": 1}, "$set": {"last_join_at": now_iso()}},
-                )
+                # Only increment counter if a NEW member was actually inserted
+                if res.upserted_id is not None:
+                    await db.invite_links.update_one(
+                        {"id": link["id"]},
+                        {"$inc": {"members_joined": 1}, "$set": {"last_join_at": now_iso()}},
+                    )
+                    log.info(f"+1 NEW member via link {link.get('link_name')}")
+                else:
+                    log.info(f"Duplicate join_request ignored for link {link.get('link_name')}")
                 if token:
                     await tg_approve_join(token, chat_id, user_id)
-                log.info(f"+1 member via link {link.get('link_name')}")
 
     # Track member leaves
     if "chat_member" in update:
