@@ -16,6 +16,7 @@ const NAV = [
   { id: "reports", icon: "📋", label: "Staff Reports" },
   { id: "charts", icon: "📊", label: "Salary Charts" },
   { id: "channels", icon: "📺", label: "Channels" },
+  { id: "approvals", icon: "✅", label: "Pending Approvals" },
   { id: "simulator", icon: "🧮", label: "Simulator" },
   { id: "audit", icon: "🔍", label: "Audit Log" },
   { id: "telegram", icon: "📨", label: "Telegram Bot" },
@@ -97,6 +98,7 @@ export default function AdminPanel() {
           {page === "audit" && <Audit />}
           {page === "telegram" && <TelegramSettings showToast={showToast} />}
           {page === "channels" && <ChannelsAdmin showToast={showToast} /> }
+          {page === "approvals" && <PendingApprovals showToast={showToast} />}
         </main>
       </div>
 

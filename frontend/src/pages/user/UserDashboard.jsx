@@ -281,6 +281,7 @@ function LinkRow({ l, copied, onCopy, onDelete }) {
       api.get(`/links/${l.id}/members`).then((r) => setDetails(r.data));
     }
   }, [open, l.id, details]);
+  const pending = l.pending_requests || 0;
   return (
     <div data-testid={`link-row-${l.id}`} style={{ background: "#fff", padding: 18, borderRadius: 12, border: "1px solid #e2e8f0" }}>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "start", marginBottom: 12 }}>
@@ -288,9 +289,17 @@ function LinkRow({ l, copied, onCopy, onDelete }) {
           <div style={{ fontWeight: 800, fontSize: 15, marginBottom: 2 }}>{l.channel_title}</div>
           <div style={{ fontSize: 11, color: "#64748b" }}>{l.link_name} · Created {fmtDate(l.created_at)}</div>
         </div>
-        <div style={{ textAlign: "right" }}>
-          <div style={{ fontSize: 26, fontWeight: 900, color: "#10b981" }}>{l.members_joined}</div>
-          <div style={{ fontSize: 10, color: "#64748b", fontWeight: 700, textTransform: "uppercase" }}>Total Joins</div>
+        <div style={{ display: "flex", gap: 16, textAlign: "right" }}>
+          <div>
+            <div style={{ fontSize: 26, fontWeight: 900, color: "#10b981" }}>{l.members_joined}</div>
+            <div style={{ fontSize: 10, color: "#64748b", fontWeight: 700, textTransform: "uppercase" }}>✓ Approved</div>
+          </div>
+          {pending > 0 && (
+            <div>
+              <div style={{ fontSize: 26, fontWeight: 900, color: "#f59e0b" }}>{pending}</div>
+              <div style={{ fontSize: 10, color: "#92400e", fontWeight: 700, textTransform: "uppercase" }}>⏳ Pending</div>
+            </div>
+          )}
         </div>
       </div>
       <div style={{ display: "flex", gap: 8, alignItems: "center", padding: "10px 12px", background: "#f8fafc", borderRadius: 8, border: "1px solid #e2e8f0" }}>
@@ -299,18 +308,29 @@ function LinkRow({ l, copied, onCopy, onDelete }) {
         <button data-testid={`link-toggle-${l.id}`} onClick={() => setOpen((p) => !p)} style={{ padding: "6px 10px", background: "#f1f5f9", color: "#475569", border: "none", borderRadius: 6, fontWeight: 700, fontSize: 11, cursor: "pointer" }}>{open ? "▴" : "▾"}</button>
         <button data-testid={`link-delete-${l.id}`} onClick={() => onDelete(l.id)} style={{ padding: "6px 10px", background: "#fef2f2", color: "#b91c1c", border: "1px solid #fecaca", borderRadius: 6, fontWeight: 700, fontSize: 11, cursor: "pointer" }}>✕</button>
       </div>
+      {pending > 0 && (
+        <div style={{ marginTop: 8, padding: "8px 12px", background: "#fef3c7", border: "1px solid #fde68a", borderRadius: 8, fontSize: 12, color: "#92400e", fontWeight: 600 }}>
+          ⏳ {pending} people clicked your link — waiting for admin approval.
+        </div>
+      )}
       {open && details && (
         <div style={{ marginTop: 10, padding: 12, background: "#f8fafc", borderRadius: 8, border: "1px solid #e2e8f0" }}>
           <div style={{ display: "flex", gap: 16, marginBottom: 10, fontSize: 12, fontWeight: 700 }}>
-            <span style={{ color: "#10b981" }}>✓ Active: {details.active}</span>
+            <span style={{ color: "#10b981" }}>✓ Approved: {details.active}</span>
             <span style={{ color: "#ef4444" }}>✕ Left: {details.left}</span>
           </div>
           <div style={{ maxHeight: 200, overflow: "auto", display: "grid", gap: 4 }}>
-            {details.members.slice(0, 30).map((m, i) => (
-              <div key={i} style={{ fontSize: 12, padding: "5px 8px", background: m.left_at ? "#fef2f2" : "#ecfdf5", borderRadius: 6, color: m.left_at ? "#991b1b" : "#047857" }}>
-                {m.first_name || m.username || `User ${m.telegram_user_id}`} {m.left_at && <span style={{ fontSize: 10, marginLeft: 6 }}>(left)</span>}
-              </div>
-            ))}
+            {details.members.slice(0, 30).map((m, i) => {
+              const bg = m.status === "left" ? "#fef2f2" : m.status === "pending" ? "#fef3c7" : "#ecfdf5";
+              const fg = m.status === "left" ? "#991b1b" : m.status === "pending" ? "#92400e" : "#047857";
+              const icon = m.status === "left" ? "✕" : m.status === "pending" ? "⏳" : "✓";
+              return (
+                <div key={i} style={{ fontSize: 12, padding: "5px 8px", background: bg, borderRadius: 6, color: fg, display: "flex", justifyContent: "space-between" }}>
+                  <span>{icon} {m.first_name || m.username || `User ${m.telegram_user_id}`}</span>
+                  <span style={{ fontSize: 10, opacity: 0.7 }}>{m.status}</span>
+                </div>
+              );
+            })}
           </div>
         </div>
       )}

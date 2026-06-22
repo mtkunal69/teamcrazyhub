@@ -977,31 +977,28 @@ async def telegram_webhook(request: Request):
         if chat_id and user_id and link_url:
             link = await db.invite_links.find_one({"link_url": link_url})
             if link:
-                # Record member entry (idempotent on (link_id, telegram_user_id))
+                # Record as PENDING — admin must manually approve
                 res = await db.link_members.update_one(
                     {"link_id": link["id"], "telegram_user_id": user_id},
-                    {"$set": {
+                    {"$setOnInsert": {
                         "link_id": link["id"],
                         "channel_id": chat_id,
                         "telegram_user_id": user_id,
                         "first_name": from_user.get("first_name", ""),
                         "username": from_user.get("username"),
-                        "joined_at": now_iso(),
+                        "status": "pending",
+                        "requested_at": now_iso(),
+                        "joined_at": None,
                         "left_at": None,
                     }},
                     upsert=True,
                 )
-                # Only increment counter if a NEW member was actually inserted
                 if res.upserted_id is not None:
                     await db.invite_links.update_one(
-                        {"id": link["id"]},
-                        {"$inc": {"members_joined": 1}, "$set": {"last_join_at": now_iso()}},
+                        {"id": link["id"]}, {"$inc": {"pending_requests": 1}},
                     )
-                    log.info(f"+1 NEW member via link {link.get('link_name')}")
-                else:
-                    log.info(f"Duplicate join_request ignored for link {link.get('link_name')}")
-                if token:
-                    await tg_approve_join(token, chat_id, user_id)
+                    log.info(f"NEW pending request via link {link.get('link_name')}")
+                # IMPORTANT: do NOT auto-approve. Admin will approve via UI.
 
     # Track member leaves
     if "chat_member" in update:
@@ -1010,14 +1007,116 @@ async def telegram_webhook(request: Request):
         new_status = cm.get("new_chat_member", {}).get("status")
         user_id = cm.get("new_chat_member", {}).get("user", {}).get("id")
         if chat_id and user_id and new_status in ("left", "kicked", "restricted"):
-            res = await db.link_members.update_many(
-                {"channel_id": chat_id, "telegram_user_id": user_id, "left_at": None},
-                {"$set": {"left_at": now_iso()}},
-            )
-            if res.modified_count:
-                log.info(f"Member {user_id} left chat {chat_id} ({res.modified_count} link entries marked)")
+            # Find approved members in this chat who match, mark as left
+            existing = await db.link_members.find_one({
+                "channel_id": chat_id, "telegram_user_id": user_id,
+                "status": "approved", "left_at": None,
+            })
+            if existing:
+                await db.link_members.update_one(
+                    {"_id": existing["_id"]},
+                    {"$set": {"status": "left", "left_at": now_iso()}},
+                )
+                # Decrement live members_joined counter
+                await db.invite_links.update_one(
+                    {"id": existing["link_id"]},
+                    {"$inc": {"members_joined": -1}},
+                )
+                log.info(f"Member {user_id} left chat {chat_id} — counter -1")
 
     return {"ok": True}
+
+# ─────────────────────────────────────────────────────────────
+# Routes — Join Requests (Admin Approval)
+# ─────────────────────────────────────────────────────────────
+@api.get("/joins/pending")
+async def list_pending_joins(admin: dict = Depends(require_admin)):
+    """All pending join requests across all links."""
+    rows = await db.link_members.find(
+        {"status": "pending"}, {"_id": 0},
+    ).sort("requested_at", -1).to_list(2000)
+    # Enrich with link info
+    link_ids = list({r["link_id"] for r in rows})
+    links = {l["id"]: l for l in await db.invite_links.find(
+        {"id": {"$in": link_ids}}, {"_id": 0},
+    ).to_list(500)}
+    for r in rows:
+        l = links.get(r["link_id"])
+        if l:
+            r["staff_name"] = l.get("staff_name")
+            r["staff_telegram"] = l.get("staff_telegram")
+            r["channel_title"] = l.get("channel_title")
+            r["link_name"] = l.get("link_name")
+    return rows
+
+@api.post("/joins/approve")
+async def approve_joins(body: dict, admin: dict = Depends(require_admin)):
+    """Approve one or many pending join requests. Body: {ids: [list]} or {all: true}"""
+    cfg = await db.settings.find_one({"key": "telegram"}, {"_id": 0})
+    if not cfg or not cfg.get("bot_token"):
+        raise HTTPException(400, "Configure Telegram bot first")
+    token = cfg["bot_token"]
+
+    if body.get("all"):
+        query = {"status": "pending"}
+    else:
+        ids = body.get("ids") or []
+        if not ids:
+            raise HTTPException(400, "Provide ids[] or all:true")
+        query = {"status": "pending", "telegram_user_id": {"$in": [int(x) for x in ids if str(x).lstrip("-").isdigit()]}}
+
+    pending = await db.link_members.find(query, {"_id": 0}).to_list(1000)
+    approved_count = 0
+    failed = []
+    for p_doc in pending:
+        res = await tg_approve_join(token, p_doc["channel_id"], p_doc["telegram_user_id"])
+        if res.get("ok"):
+            await db.link_members.update_one(
+                {"link_id": p_doc["link_id"], "telegram_user_id": p_doc["telegram_user_id"]},
+                {"$set": {"status": "approved", "joined_at": now_iso()}},
+            )
+            await db.invite_links.update_one(
+                {"id": p_doc["link_id"]},
+                {"$inc": {"members_joined": 1, "pending_requests": -1},
+                 "$set": {"last_join_at": now_iso()}},
+            )
+            approved_count += 1
+        else:
+            failed.append({"user_id": p_doc["telegram_user_id"], "error": res.get("error")})
+    return {"ok": True, "approved": approved_count, "failed": failed}
+
+@api.post("/joins/decline")
+async def decline_joins(body: dict, admin: dict = Depends(require_admin)):
+    """Decline a pending join request. Body: {ids: [telegram_user_id list]}"""
+    cfg = await db.settings.find_one({"key": "telegram"}, {"_id": 0})
+    if not cfg or not cfg.get("bot_token"):
+        raise HTTPException(400, "Configure Telegram bot first")
+    token = cfg["bot_token"]
+    ids = body.get("ids") or []
+    if not ids:
+        raise HTTPException(400, "Provide ids[]")
+
+    from telegram_service import decline_join_request as tg_decline
+    declined = 0
+    for uid in ids:
+        try:
+            uid_int = int(uid)
+        except Exception:
+            continue
+        p_doc = await db.link_members.find_one({"telegram_user_id": uid_int, "status": "pending"}, {"_id": 0})
+        if not p_doc:
+            continue
+        res = await tg_decline(token, p_doc["channel_id"], uid_int)
+        if res.get("ok"):
+            await db.link_members.update_one(
+                {"link_id": p_doc["link_id"], "telegram_user_id": uid_int},
+                {"$set": {"status": "declined", "declined_at": now_iso()}},
+            )
+            await db.invite_links.update_one(
+                {"id": p_doc["link_id"]}, {"$inc": {"pending_requests": -1}},
+            )
+            declined += 1
+    return {"ok": True, "declined": declined}
 
 # ─────────────────────────────────────────────────────────────
 # Routes — Channels (Admin-managed)
@@ -1270,14 +1369,16 @@ async def run_daily_auto_reports(force: bool = False):
         if not links:
             continue
         link_ids = [l["id"] for l in links]
-        # Net active = joined in period AND (left_at is null OR left_at > period_end)
+        # Net active = approved in period AND (left_at is null OR left_at > period_end)
         active_count = await db.link_members.count_documents({
             "link_id": {"$in": link_ids},
+            "status": "approved",
             "joined_at": {"$gte": period_start_utc, "$lt": period_end_utc},
             "$or": [{"left_at": None}, {"left_at": {"$gte": period_end_utc}}],
         })
         total_joined = await db.link_members.count_documents({
             "link_id": {"$in": link_ids},
+            "status": {"$in": ["approved", "left"]},
             "joined_at": {"$gte": period_start_utc, "$lt": period_end_utc},
         })
         left_count = total_joined - active_count
