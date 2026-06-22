@@ -595,10 +595,23 @@ function TelegramSettings({ showToast }) {
 
   const set = (k, v) => setCfg((c) => ({ ...c, [k]: v }));
 
+  async function setupWebhook() {
+    try {
+      const { data } = await api.post("/settings/telegram/setup-webhook");
+      if (data.ok) {
+        showToast(`✓ Webhook registered: bot @${data.bot_username}`);
+      } else {
+        showToast(`✕ ${data.error || "Setup failed"}`, "error");
+      }
+    } catch (e) {
+      showToast(e.response?.data?.detail || "Setup failed", "error");
+    }
+  }
+
   return (
     <div>
       <h1 style={{ fontSize: 28, fontWeight: 900, margin: "0 0 4px" }}>📨 Telegram Bot</h1>
-      <p style={{ color: C.muted, fontSize: 13, margin: "0 0 24px" }}>Get instant report notifications + daily salary chart at 12 PM IST.</p>
+      <p style={{ color: C.muted, fontSize: 13, margin: "0 0 24px" }}>Real-time member counting via invite link tracking. 100% accurate · No video needed.</p>
 
       {/* How-to */}
       <div style={{ background: C.accentDim, border: `1px solid ${C.accent}40`, borderLeft: `3px solid ${C.accent}`, borderRadius: 10, padding: 16, marginBottom: 22 }}>
@@ -645,6 +658,74 @@ function TelegramSettings({ showToast }) {
           <button data-testid="tg-test-btn" onClick={test} disabled={testing || !cfg.bot_token || !cfg.chat_id} style={{ ...btnGhost, color: C.green, borderColor: C.green + "40", flex: 1, padding: "9px 18px" }}>{testing ? "Sending..." : "🧪 Save & Send Test Message"}</button>
         </div>
         <button data-testid="tg-send-daily-now-btn" onClick={sendDailyNow} disabled={!cfg.enabled} style={{ ...btnGhost, color: C.amber, borderColor: C.amber + "40", padding: "9px 18px" }}>📊 Send Today's Daily Summary Now (manual trigger)</button>
+        <button data-testid="tg-setup-webhook-btn" onClick={setupWebhook} disabled={!cfg.bot_token} style={{ ...btnGhost, color: C.purple, borderColor: C.purple + "40", padding: "9px 18px" }}>🔌 Register Webhook (required for link tracking)</button>
+      </div>
+      <ConnectedChannels />
+    </div>
+  );
+}
+
+function ConnectedChannels() {
+  const [chs, setChs] = useState([]);
+  const [links, setLinks] = useState([]);
+  useEffect(() => {
+    const load = () => Promise.all([api.get("/channels"), api.get("/links")]).then(([c, l]) => {
+      setChs(c.data); setLinks(l.data);
+    });
+    load();
+    const t = setInterval(load, 8000);
+    return () => clearInterval(t);
+  }, []);
+  return (
+    <div style={{ marginTop: 28 }}>
+      <h3 style={{ fontSize: 16, fontWeight: 800, margin: "0 0 12px" }}>📺 Connected Channels ({chs.length})</h3>
+      <div style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 12, padding: 16, marginBottom: 22 }}>
+        {chs.length === 0 ? (
+          <div style={{ color: C.muted, fontSize: 12, textAlign: "center", padding: 18 }}>
+            No channels yet. Add bot as admin to a channel → it'll appear here automatically.
+          </div>
+        ) : (
+          <div style={{ display: "grid", gap: 8 }}>
+            {chs.map((c) => (
+              <div key={c.chat_id} style={{ display: "flex", justifyContent: "space-between", padding: "10px 14px", background: C.bg, borderRadius: 8 }}>
+                <div>
+                  <div style={{ fontWeight: 700, fontSize: 13 }}>{c.title}</div>
+                  <div style={{ fontSize: 11, color: C.muted }}>{c.username ? "@" + c.username : c.chat_id} · {c.type} · {c.bot_status}</div>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
+      <h3 style={{ fontSize: 16, fontWeight: 800, margin: "0 0 12px" }}>🔗 All Staff Links ({links.length})</h3>
+      <div style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 12, overflow: "auto" }}>
+        {links.length === 0 ? (
+          <div style={{ color: C.muted, fontSize: 12, textAlign: "center", padding: 24 }}>No links generated yet by staff.</div>
+        ) : (
+          <table style={{ width: "100%", borderCollapse: "collapse" }}>
+            <thead style={{ background: C.surface }}>
+              <tr>
+                {["Staff", "Channel", "Members Joined", "Link Created"].map((h) => (
+                  <th key={h} style={{ padding: "10px 14px", textAlign: "left", fontSize: 10, color: C.muted, fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.08em", borderBottom: `1px solid ${C.border}` }}>{h}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {links.map((l) => (
+                <tr key={l.id} style={{ borderBottom: `1px solid ${C.border}` }}>
+                  <td style={dkTd}>
+                    <div style={{ fontWeight: 700 }}>{l.staff_name}</div>
+                    <div style={{ fontSize: 11, color: C.muted }}>{l.staff_telegram}</div>
+                  </td>
+                  <td style={dkTd}>{l.channel_title}</td>
+                  <td style={{ ...dkTd, fontWeight: 800, color: C.green, fontSize: 16 }}>{l.members_joined}</td>
+                  <td style={{ ...dkTd, fontSize: 11, color: C.muted }}>{new Date(l.created_at).toLocaleDateString()}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
       </div>
     </div>
   );

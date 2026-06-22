@@ -13,7 +13,7 @@ import logging
 from datetime import datetime, timezone, timedelta
 from typing import List, Optional, Literal
 
-from fastapi import FastAPI, APIRouter, Depends, HTTPException, Header, Query, UploadFile, File, Form
+from fastapi import FastAPI, APIRouter, Depends, HTTPException, Header, Query, UploadFile, File, Form, Request
 from fastapi.responses import StreamingResponse
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -32,6 +32,14 @@ from telegram_service import (
     build_report_notification,
     build_daily_summary,
     get_config as tg_get_config,
+    set_webhook as tg_set_webhook,
+    delete_webhook as tg_delete_webhook,
+    get_webhook_info as tg_get_webhook_info,
+    get_me as tg_get_me,
+    get_chat as tg_get_chat,
+    create_invite_link as tg_create_invite,
+    revoke_invite_link as tg_revoke_invite,
+    approve_join_request as tg_approve_join,
 )
 import httpx
 from gemini_service import (
@@ -160,6 +168,15 @@ class GeminiSettings(BaseModel):
     api_key: str = ""
     model: str = "gemini-2.5-flash"
     enabled: bool = False
+
+class LinkCreateIn(BaseModel):
+    channel: str  # @username OR numeric chat_id
+    name: Optional[str] = None  # optional link label
+
+class ReportIn(BaseModel):
+    worker_type: str
+    link_id: Optional[str] = None  # invite link to count
+    member_count: Optional[int] = None  # manual fallback if no link
 
 # ─────────────────────────────────────────────────────────────
 # Seed defaults
@@ -427,125 +444,63 @@ async def ai_count(body: AICountIn, _: dict = Depends(require_user)):
     }
 
 @api.post("/reports")
-async def submit_report(
-    p: dict = Depends(require_user),
-    worker_type: str = Form(...),
-    member_count: int = Form(...),
-    video: UploadFile = File(...),
-):
-    """Real AI-powered report submission:
-    1. Save uploaded video to temp file
-    2. Run Gemini Flash video analysis (if configured) — deterministic count
-    3. Compare AI count vs entered count → VERIFIED / MISMATCH
-    4. Calculate salary from AI count + salary slabs
-    5. Send instant Telegram notification (if enabled)
+async def submit_report(body: ReportIn, p: dict = Depends(require_user)):
+    """Submit a daily salary report.
+    - If link_id provided: count comes from invite_links.members_joined (real-time Telegram data)
+    - Else: uses provided member_count (manual fallback, marked as MANUAL source)
     """
-    if worker_type not in WORKER_TYPES:
+    if body.worker_type not in WORKER_TYPES:
         raise HTTPException(400, "Invalid worker type")
 
-    # Save video to temp file
-    suffix = os.path.splitext(video.filename or "video.mp4")[1] or ".mp4"
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+    user = await db.users.find_one({"id": p["sub"]}, {"_id": 0})
+    if not user:
+        raise HTTPException(404, "User not found")
+
+    channel_title = None
+    source = "MANUAL"
+    if body.link_id:
+        link = await db.invite_links.find_one({"id": body.link_id, "staff_user_id": p["sub"]}, {"_id": 0})
+        if not link:
+            raise HTTPException(404, "Link not found or not yours")
+        ai_count_val = int(link.get("members_joined", 0))
+        channel_title = link.get("channel_title")
+        source = "INVITE_LINK"
+    elif body.member_count is not None:
+        ai_count_val = int(body.member_count)
+    else:
+        raise HTTPException(400, "Provide either link_id or member_count")
+
+    # Status: with invite link, always VERIFIED (count is authoritative from Telegram)
+    # With manual: always VERIFIED too (no separate AI to compare with)
+    status = "VERIFIED"
+    salary, slab = await calc_salary(body.worker_type, ai_count_val)
+
+    doc = {
+        "id": str(uuid.uuid4()),
+        "user_id": p["sub"],
+        "name": user["name"],
+        "telegram": user["telegram"],
+        "worker_type": body.worker_type,
+        "member_count": ai_count_val,
+        "ai_count": ai_count_val,
+        "source": source,
+        "link_id": body.link_id,
+        "channel_title": channel_title,
+        "salary": salary,
+        "status": status,
+        "slab_label": slab,
+        "created_at": now_iso(),
+    }
+    await db.reports.insert_one(doc)
+    doc.pop("_id", None)
+
     try:
-        shutil.copyfileobj(video.file, tmp)
-        tmp.close()
-        video_path = tmp.name
-        video_size = os.path.getsize(video_path)
-        log.info(f"Received video: {video.filename} ({video_size/1024/1024:.1f} MB)")
-
-        # Try real Gemini AI first
-        ai_count_val = None
-        premium = 0
-        members_detected = []
-        confidence = "medium"
-        ai_source = "MOCK"
-        ai_error = None
-
-        gem_cfg = await get_gemini_config(db)
-        if gem_cfg and gem_cfg.get("enabled") and gem_cfg.get("api_key"):
-            result = await gemini_analyze(
-                gem_cfg["api_key"], video_path,
-                model=gem_cfg.get("model", "gemini-2.5-flash"),
-            )
-            if result.get("ok"):
-                ai_count_val = result["count"]
-                premium = result.get("premium_count", 0)
-                confidence = result.get("confidence", "medium")
-                ai_source = "GEMINI"
-                names = result.get("sample_names", []) or SAMPLE_NAMES[:8]
-                for i, nm in enumerate(names[:15]):
-                    members_detected.append({
-                        "name": nm,
-                        "premium": i < premium,
-                        "badge": "\u2b50 Premium" if i < premium else None,
-                    })
-            else:
-                ai_error = result.get("error", "Gemini failed")
-                log.warning(f"Gemini analysis failed: {ai_error}")
-
-        # Fallback to mock if Gemini not configured/failed
-        if ai_count_val is None:
-            roll = random.random()
-            if roll < 0.25:
-                delta_pct = random.uniform(0.15, 0.40)
-                sign = 1 if random.random() > 0.5 else -1
-                ai_count_val = max(0, int(member_count * (1 + sign * delta_pct)))
-                if ai_count_val == member_count:
-                    ai_count_val = max(0, member_count + (5 * sign))
-            else:
-                ai_count_val = max(0, member_count + random.randint(-2, 2))
-            premium = max(0, int(ai_count_val * 0.2))
-            for i in range(min(15, ai_count_val)):
-                members_detected.append({
-                    "name": random.choice(SAMPLE_NAMES),
-                    "premium": i < premium,
-                    "badge": "\u2b50 Premium" if i < premium else None,
-                })
-
-        matched = abs(ai_count_val - member_count) <= 3
-        status = "VERIFIED" if matched else "MISMATCH COUNTING"
-        salary, slab = await calc_salary(worker_type, ai_count_val)
-
-        user = await db.users.find_one({"id": p["sub"]}, {"_id": 0})
-        doc = {
-            "id": str(uuid.uuid4()),
-            "user_id": p["sub"],
-            "name": user["name"] if user else p["name"],
-            "telegram": user["telegram"] if user else "",
-            "worker_type": worker_type,
-            "member_count": member_count,
-            "ai_count": ai_count_val,
-            "ai_source": ai_source,
-            "ai_confidence": confidence,
-            "ai_error": ai_error,
-            "premium_count": premium,
-            "salary": salary,
-            "status": status,
-            "slab_label": slab,
-            "video_filename": video.filename,
-            "video_size_mb": round(video_size / 1024 / 1024, 2),
-            "video_proof": True,
-            "members_detected": members_detected,
-            "created_at": now_iso(),
-        }
-        await db.reports.insert_one(doc)
-        doc.pop("_id", None)
-
-        # Fire Telegram notification (non-blocking failure)
-        try:
-            cfg = await tg_get_config(db)
-            if cfg and cfg.get("enabled") and cfg.get("notify_on_report", True):
-                await tg_send(db, build_report_notification(doc))
-        except Exception as e:
-            log.warning(f"TG notify failed: {e}")
-
-        return doc
-    finally:
-        # Cleanup temp file
-        try:
-            os.unlink(tmp.name)
-        except Exception:
-            pass
+        cfg = await tg_get_config(db)
+        if cfg and cfg.get("enabled") and cfg.get("notify_on_report", True):
+            await tg_send(db, build_report_notification(doc))
+    except Exception as e:
+        log.warning(f"TG notify failed: {e}")
+    return doc
 
 @api.get("/reports")
 async def list_reports(
@@ -898,6 +853,175 @@ async def test_gemini(admin: dict = Depends(require_admin)):
     if not cfg:
         return {"ok": False, "error": "Save API key first"}
     return await gemini_test_key(cfg.get("api_key", ""))
+
+# ─────────────────────────────────────────────────────────────
+# Routes — Telegram Webhook + Invite Link Tracking
+# ─────────────────────────────────────────────────────────────
+@api.post("/settings/telegram/setup-webhook")
+async def setup_webhook(request: Request, admin: dict = Depends(require_admin)):
+    cfg = await db.settings.find_one({"key": "telegram"}, {"_id": 0})
+    if not cfg or not cfg.get("bot_token"):
+        return {"ok": False, "error": "Save bot token first"}
+    base = str(request.base_url).rstrip("/")
+    if base.startswith("http://") and "localhost" not in base and "127.0.0.1" not in base:
+        base = base.replace("http://", "https://", 1)
+    webhook_url = f"{base}/api/telegram/webhook"
+    res = await tg_set_webhook(cfg["bot_token"], webhook_url)
+    if res.get("ok"):
+        me = await tg_get_me(cfg["bot_token"])
+        bot_user = me.get("result", {}).get("username") if me.get("ok") else None
+        await db.settings.update_one(
+            {"key": "telegram"},
+            {"$set": {"bot_username": bot_user, "webhook_url": webhook_url}},
+        )
+        return {"ok": True, "webhook_url": webhook_url, "bot_username": bot_user}
+    return res
+
+@api.get("/settings/telegram/webhook-info")
+async def webhook_info(admin: dict = Depends(require_admin)):
+    cfg = await db.settings.find_one({"key": "telegram"}, {"_id": 0})
+    if not cfg or not cfg.get("bot_token"):
+        return {"ok": False, "error": "Save bot token first"}
+    return await tg_get_webhook_info(cfg["bot_token"])
+
+@api.post("/telegram/webhook")
+async def telegram_webhook(request: Request):
+    """Public — Telegram POSTs updates here. Handles chat_join_request + my_chat_member."""
+    try:
+        update = await request.json()
+    except Exception:
+        return {"ok": True}
+
+    log.info(f"Telegram update keys: {list(update.keys())}")
+    cfg = await db.settings.find_one({"key": "telegram"}, {"_id": 0})
+    token = (cfg or {}).get("bot_token", "") if cfg else ""
+
+    if "my_chat_member" in update:
+        mcm = update["my_chat_member"]
+        chat = mcm.get("chat", {})
+        new_status = mcm.get("new_chat_member", {}).get("status")
+        if new_status in ("administrator", "member"):
+            await db.channels.update_one(
+                {"chat_id": chat.get("id")},
+                {"$set": {
+                    "chat_id": chat.get("id"),
+                    "title": chat.get("title"),
+                    "username": chat.get("username"),
+                    "type": chat.get("type"),
+                    "bot_status": new_status,
+                    "added_at": now_iso(),
+                }},
+                upsert=True,
+            )
+            log.info(f"Bot is {new_status} in chat: {chat.get('title')} ({chat.get('id')})")
+        elif new_status in ("left", "kicked"):
+            await db.channels.update_one(
+                {"chat_id": chat.get("id")},
+                {"$set": {"bot_status": new_status, "removed_at": now_iso()}},
+            )
+
+    if "chat_join_request" in update:
+        req = update["chat_join_request"]
+        chat_id = req.get("chat", {}).get("id")
+        user_id = req.get("from", {}).get("id")
+        link_url = (req.get("invite_link") or {}).get("invite_link", "")
+
+        if chat_id and user_id and link_url:
+            link = await db.invite_links.find_one({"link_url": link_url})
+            if link:
+                await db.invite_links.update_one(
+                    {"id": link["id"]},
+                    {"$inc": {"members_joined": 1}, "$set": {"last_join_at": now_iso()}},
+                )
+                if token:
+                    await tg_approve_join(token, chat_id, user_id)
+                log.info(f"+1 member via link {link.get('link_name')} (total: {link.get('members_joined',0)+1})")
+    return {"ok": True}
+
+# ─────────────────────────────────────────────────────────────
+# Routes — Invite Links
+# ─────────────────────────────────────────────────────────────
+@api.get("/links/me")
+async def my_links(p: dict = Depends(require_user)):
+    return await db.invite_links.find({"staff_user_id": p["sub"]}, {"_id": 0}).sort("created_at", -1).to_list(100)
+
+@api.get("/links")
+async def all_links(admin: dict = Depends(require_admin)):
+    return await db.invite_links.find({}, {"_id": 0}).sort("created_at", -1).to_list(1000)
+
+@api.get("/channels")
+async def list_channels(admin: dict = Depends(require_admin)):
+    return await db.channels.find(
+        {"bot_status": {"$in": ["administrator", "member"]}}, {"_id": 0},
+    ).sort("added_at", -1).to_list(100)
+
+@api.post("/links/create")
+async def create_link(body: LinkCreateIn, p: dict = Depends(require_user)):
+    cfg = await db.settings.find_one({"key": "telegram"}, {"_id": 0})
+    if not cfg or not cfg.get("bot_token"):
+        raise HTTPException(400, "Telegram bot not configured. Ask admin to set it up.")
+    token = cfg["bot_token"]
+    channel = body.channel.strip()
+    if not channel:
+        raise HTTPException(400, "Channel is required")
+    chat_resp = await tg_get_chat(token, channel)
+    if not chat_resp.get("ok"):
+        err = chat_resp.get("error", "")
+        if "chat not found" in err.lower():
+            raise HTTPException(400, "Channel not found. Make sure bot is added as admin in that channel.")
+        raise HTTPException(400, f"Could not resolve channel: {err}")
+
+    chat = chat_resp["result"]
+    chat_id = chat["id"]
+    chat_title = chat.get("title") or chat.get("username") or str(chat_id)
+
+    user = await db.users.find_one({"id": p["sub"]}, {"_id": 0})
+    link_name = (body.name or f"{user['name']}'s Link")[:32]
+    link_resp = await tg_create_invite(token, chat_id, name=link_name, creates_join_request=True)
+    if not link_resp.get("ok"):
+        err = link_resp.get("error", "")
+        if "rights" in err.lower() or "not enough" in err.lower():
+            raise HTTPException(400, "Bot is not admin in that channel OR lacks 'Invite Users' permission")
+        raise HTTPException(400, f"Could not create link: {err}")
+
+    invite = link_resp["result"]
+    doc = {
+        "id": str(uuid.uuid4()),
+        "staff_user_id": p["sub"],
+        "staff_name": user["name"],
+        "staff_telegram": user["telegram"],
+        "channel_id": chat_id,
+        "channel_title": chat_title,
+        "channel_username": chat.get("username"),
+        "link_url": invite["invite_link"],
+        "link_name": link_name,
+        "members_joined": 0,
+        "created_at": now_iso(),
+        "active": True,
+    }
+    await db.invite_links.insert_one(doc)
+    await db.channels.update_one(
+        {"chat_id": chat_id},
+        {"$set": {
+            "chat_id": chat_id, "title": chat_title,
+            "username": chat.get("username"), "type": chat.get("type"),
+            "bot_status": "administrator", "added_at": now_iso(),
+        }},
+        upsert=True,
+    )
+    doc.pop("_id", None)
+    return doc
+
+@api.delete("/links/{lid}")
+async def delete_link(lid: str, p: dict = Depends(require_user)):
+    link = await db.invite_links.find_one({"id": lid, "staff_user_id": p["sub"]}, {"_id": 0})
+    if not link:
+        raise HTTPException(404, "Link not found or not yours")
+    cfg = await db.settings.find_one({"key": "telegram"}, {"_id": 0})
+    if cfg and cfg.get("bot_token"):
+        await tg_revoke_invite(cfg["bot_token"], link["channel_id"], link["link_url"])
+    await db.invite_links.delete_one({"id": lid})
+    return {"ok": True}
 
 # ─────────────────────────────────────────────────────────────
 # Daily summary scheduler (12 PM IST)
