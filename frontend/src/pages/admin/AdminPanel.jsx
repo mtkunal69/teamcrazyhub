@@ -17,6 +17,7 @@ const NAV = [
   { id: "charts", icon: "📊", label: "Salary Charts" },
   { id: "simulator", icon: "🧮", label: "Simulator" },
   { id: "audit", icon: "🔍", label: "Audit Log" },
+  { id: "telegram", icon: "📨", label: "Telegram Bot" },
 ];
 
 export default function AdminPanel() {
@@ -93,6 +94,7 @@ export default function AdminPanel() {
           {page === "charts" && <Charts charts={charts} reload={reloadCharts} showToast={showToast} />}
           {page === "simulator" && <Simulator charts={charts} />}
           {page === "audit" && <Audit />}
+          {page === "telegram" && <TelegramSettings showToast={showToast} />}
         </main>
       </div>
 
@@ -522,6 +524,124 @@ function Audit() {
     </div>
   );
 }
+
+// ─── TELEGRAM SETTINGS ───────────────────────────────────────
+function TelegramSettings({ showToast }) {
+  const [cfg, setCfg] = useState({ bot_token: "", chat_id: "", enabled: false, notify_on_report: true, daily_summary: true });
+  const [saving, setSaving] = useState(false);
+  const [testing, setTesting] = useState(false);
+
+  useEffect(() => {
+    api.get("/settings/telegram").then((r) => setCfg(r.data));
+  }, []);
+
+  async function save() {
+    setSaving(true);
+    try {
+      await api.put("/settings/telegram", cfg);
+      showToast("✓ Telegram settings saved");
+    } catch (e) {
+      showToast("Failed to save", "error");
+    } finally { setSaving(false); }
+  }
+
+  async function test() {
+    setTesting(true);
+    try {
+      await api.put("/settings/telegram", cfg); // save first
+      const { data } = await api.post("/settings/telegram/test");
+      if (data.ok) showToast("✓ Test message delivered to Telegram", "success");
+      else showToast(`✕ ${data.error || "Test failed"}`, "error");
+    } catch (e) {
+      showToast(e.response?.data?.detail || "Test failed", "error");
+    } finally { setTesting(false); }
+  }
+
+  async function sendDailyNow() {
+    if (!window.confirm("Send today's salary summary to Telegram right now?")) return;
+    try {
+      await api.post("/settings/telegram/send-daily-now");
+      showToast("✓ Daily summary sent", "success");
+    } catch (e) {
+      showToast(e.response?.data?.detail || "Send failed", "error");
+    }
+  }
+
+  const set = (k, v) => setCfg((c) => ({ ...c, [k]: v }));
+
+  return (
+    <div>
+      <h1 style={{ fontSize: 28, fontWeight: 900, margin: "0 0 4px" }}>📨 Telegram Bot</h1>
+      <p style={{ color: C.muted, fontSize: 13, margin: "0 0 24px" }}>Get instant report notifications + daily salary chart at 12 PM IST.</p>
+
+      {/* How-to */}
+      <div style={{ background: C.accentDim, border: `1px solid ${C.accent}40`, borderLeft: `3px solid ${C.accent}`, borderRadius: 10, padding: 16, marginBottom: 22 }}>
+        <div style={{ fontWeight: 800, fontSize: 13, color: C.accent, marginBottom: 8 }}>⚡ Quick Setup (2 minutes)</div>
+        <ol style={{ margin: 0, paddingLeft: 18, fontSize: 12, color: C.text, lineHeight: 1.8 }}>
+          <li>Open Telegram → search <b>@BotFather</b> → send <code style={codeS}>/newbot</code> → follow prompts → copy the <b>Bot Token</b></li>
+          <li>Create a Telegram group (or use existing) → add your new bot as member → make it admin</li>
+          <li>Send any message in the group, then open <code style={codeS}>https://api.telegram.org/bot&lt;TOKEN&gt;/getUpdates</code> in browser → copy the <code style={codeS}>chat.id</code> (group IDs start with <code style={codeS}>-100</code>)</li>
+          <li>Paste both below, toggle <b>Enable</b>, hit <b>Save & Test</b></li>
+        </ol>
+      </div>
+
+      <div style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 12, padding: 24, display: "grid", gap: 16, maxWidth: 720 }}>
+        <label style={{ display: "grid", gap: 6 }}>
+          <span style={{ fontSize: 11, color: C.muted, fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.06em" }}>Bot Token</span>
+          <input
+            data-testid="tg-bot-token-input"
+            value={cfg.bot_token}
+            onChange={(e) => set("bot_token", e.target.value)}
+            placeholder="123456789:ABCdefGHI_jklMNO..."
+            type="password"
+            style={dkInp}
+          />
+        </label>
+        <label style={{ display: "grid", gap: 6 }}>
+          <span style={{ fontSize: 11, color: C.muted, fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.06em" }}>Chat ID (group or personal)</span>
+          <input
+            data-testid="tg-chat-id-input"
+            value={cfg.chat_id}
+            onChange={(e) => set("chat_id", e.target.value)}
+            placeholder="-1001234567890"
+            style={dkInp}
+          />
+        </label>
+
+        <div style={{ borderTop: `1px solid ${C.border}`, paddingTop: 16, display: "grid", gap: 10 }}>
+          <Toggle data-testid="tg-enabled" label="Enable Telegram bot" sub="Master switch — turn off to silence everything" v={cfg.enabled} onChange={(v) => set("enabled", v)} />
+          <Toggle data-testid="tg-notify-on-report" label="Instant notification on every new report" sub="Sends a message the moment a worker submits" v={cfg.notify_on_report} onChange={(v) => set("notify_on_report", v)} />
+          <Toggle data-testid="tg-daily-summary" label="Daily salary chart at 12:00 PM IST" sub="Consolidated report of last 24h sent to your group" v={cfg.daily_summary} onChange={(v) => set("daily_summary", v)} />
+        </div>
+
+        <div style={{ display: "flex", gap: 10, paddingTop: 8 }}>
+          <button data-testid="tg-save-btn" onClick={save} disabled={saving} style={{ ...btnPrimary, flex: 1 }}>{saving ? "Saving..." : "💾 Save"}</button>
+          <button data-testid="tg-test-btn" onClick={test} disabled={testing || !cfg.bot_token || !cfg.chat_id} style={{ ...btnGhost, color: C.green, borderColor: C.green + "40", flex: 1, padding: "9px 18px" }}>{testing ? "Sending..." : "🧪 Save & Send Test Message"}</button>
+        </div>
+        <button data-testid="tg-send-daily-now-btn" onClick={sendDailyNow} disabled={!cfg.enabled} style={{ ...btnGhost, color: C.amber, borderColor: C.amber + "40", padding: "9px 18px" }}>📊 Send Today's Daily Summary Now (manual trigger)</button>
+      </div>
+    </div>
+  );
+}
+
+function Toggle({ label, sub, v, onChange, ...rest }) {
+  return (
+    <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "10px 0" }}>
+      <div>
+        <div style={{ fontSize: 13, fontWeight: 700, color: C.text }}>{label}</div>
+        {sub && <div style={{ fontSize: 11, color: C.muted, marginTop: 2 }}>{sub}</div>}
+      </div>
+      <label style={{ cursor: "pointer", display: "inline-flex", alignItems: "center" }}>
+        <input {...rest} type="checkbox" checked={v} onChange={(e) => onChange(e.target.checked)} style={{ display: "none" }} />
+        <div style={{ width: 42, height: 24, borderRadius: 12, background: v ? C.accent : C.border, position: "relative", transition: "background .2s" }}>
+          <div style={{ position: "absolute", top: 2, left: v ? 20 : 2, width: 20, height: 20, borderRadius: "50%", background: "#fff", transition: "left .2s" }} />
+        </div>
+      </label>
+    </div>
+  );
+}
+
+const codeS = { background: C.bg, padding: "1px 6px", borderRadius: 4, fontSize: 11, color: C.accent, fontFamily: "monospace" };
 
 // ─── shared styles ───────────────────────────────────────────
 const dkInp = { padding: "9px 12px", borderRadius: 8, border: `1px solid ${C.border}`, fontSize: 12, color: C.text, background: C.bg, outline: "none", fontWeight: 500 };

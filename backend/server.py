@@ -17,6 +17,16 @@ from fastapi import FastAPI, APIRouter, Depends, HTTPException, Header, Query
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel, Field, ConfigDict
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
+import pytz
+
+from telegram_service import (
+    send_message as tg_send,
+    build_report_notification,
+    build_daily_summary,
+    get_config as tg_get_config,
+)
 
 # ─────────────────────────────────────────────────────────────
 # Config & DB
@@ -126,6 +136,13 @@ class ReportIn(BaseModel):
 class AICountIn(BaseModel):
     entered_count: int
     worker_type: str
+
+class TelegramSettings(BaseModel):
+    bot_token: str = ""
+    chat_id: str = ""
+    enabled: bool = False
+    notify_on_report: bool = True
+    daily_summary: bool = True
 
 # ─────────────────────────────────────────────────────────────
 # Seed defaults
@@ -402,6 +419,14 @@ async def submit_report(body: ReportIn, p: dict = Depends(require_user)):
     }
     await db.reports.insert_one(doc)
     doc.pop("_id", None)
+
+    # Fire Telegram notification (non-blocking failure)
+    try:
+        cfg = await tg_get_config(db)
+        if cfg and cfg.get("enabled") and cfg.get("notify_on_report", True):
+            await tg_send(db, build_report_notification(doc))
+    except Exception as e:
+        log.warning(f"TG notify failed: {e}")
     return doc
 
 @api.get("/reports")
@@ -483,6 +508,68 @@ async def health():
     return {"status": "ok", "time": now_iso()}
 
 # ─────────────────────────────────────────────────────────────
+# Routes — Telegram Settings
+# ─────────────────────────────────────────────────────────────
+@api.get("/settings/telegram")
+async def get_tg_settings(admin: dict = Depends(require_admin)):
+    cfg = await db.settings.find_one({"key": "telegram"}, {"_id": 0})
+    if not cfg:
+        return {"bot_token": "", "chat_id": "", "enabled": False,
+                "notify_on_report": True, "daily_summary": True}
+    cfg.pop("key", None)
+    return cfg
+
+@api.put("/settings/telegram")
+async def set_tg_settings(body: TelegramSettings, admin: dict = Depends(require_admin)):
+    doc = body.model_dump()
+    doc["key"] = "telegram"
+    doc["updated_at"] = now_iso()
+    doc["updated_by"] = admin["name"]
+    await db.settings.update_one({"key": "telegram"}, {"$set": doc}, upsert=True)
+    return {"ok": True, "saved": True}
+
+@api.post("/settings/telegram/test")
+async def test_tg(admin: dict = Depends(require_admin)):
+    res = await tg_send(db,
+        "✅ <b>TeamCrazy Hub</b> — test message\n"
+        "Your Telegram bot is connected and working.\n"
+        f"Sent by: <b>{admin['name']}</b> · {now_iso()[:19]} UTC"
+    )
+    return res
+
+@api.post("/settings/telegram/send-daily-now")
+async def send_daily_now(admin: dict = Depends(require_admin)):
+    """Manually trigger today's summary (useful for testing)."""
+    await run_daily_summary_job(force=True)
+    return {"ok": True}
+
+# ─────────────────────────────────────────────────────────────
+# Daily summary scheduler (12 PM IST)
+# ─────────────────────────────────────────────────────────────
+IST = pytz.timezone("Asia/Kolkata")
+scheduler: Optional[AsyncIOScheduler] = None
+
+async def run_daily_summary_job(force: bool = False):
+    cfg = await tg_get_config(db)
+    if not cfg or not cfg.get("enabled"):
+        log.info("Daily summary skipped: telegram disabled")
+        return
+    if not force and not cfg.get("daily_summary", True):
+        log.info("Daily summary skipped: daily_summary off")
+        return
+    # Collect reports from last 24h (IST window: yesterday 12 PM to today 12 PM)
+    now_utc = datetime.now(timezone.utc)
+    since_utc = now_utc - timedelta(hours=24)
+    rows = await db.reports.find(
+        {"created_at": {"$gte": since_utc.isoformat()}},
+        {"_id": 0},
+    ).sort("created_at", -1).to_list(2000)
+    date_str = datetime.now(IST).strftime("%d %b %Y")
+    msg = build_daily_summary(rows, date_str)
+    res = await tg_send(db, msg)
+    log.info(f"Daily summary sent: {res}")
+
+# ─────────────────────────────────────────────────────────────
 # App wiring
 # ─────────────────────────────────────────────────────────────
 app.include_router(api)
@@ -500,8 +587,19 @@ async def on_start():
     await ensure_indexes()
     await seed_admin()
     await seed_slabs()
-    log.info("TeamCrazy Hub API ready")
+    global scheduler
+    scheduler = AsyncIOScheduler(timezone=IST)
+    scheduler.add_job(
+        run_daily_summary_job,
+        CronTrigger(hour=12, minute=0, timezone=IST),
+        id="daily_salary_summary",
+        replace_existing=True,
+    )
+    scheduler.start()
+    log.info("TeamCrazy Hub API ready · Daily summary scheduled @ 12:00 IST")
 
 @app.on_event("shutdown")
 async def on_stop():
+    if scheduler:
+        scheduler.shutdown(wait=False)
     client.close()
