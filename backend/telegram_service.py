@@ -96,12 +96,12 @@ def build_daily_summary(reports: list, date_str: str) -> str:
 
     lines = [
         f"📊 <b>Daily Salary Report</b> · {date_str}",
-        f"━━━━━━━━━━━━━━━━━━━━━",
+        "━━━━━━━━━━━━━━━━━━━━━",
         f"👥 <b>Total Reports:</b> {len(reports)}",
         f"✅ <b>Verified:</b> {verified}    ⚠️ <b>Mismatch:</b> {mismatch}",
         f"💰 <b>Total Paid Out:</b> ₹{total_paid:,}",
-        f"━━━━━━━━━━━━━━━━━━━━━",
-        f"<b>Worker-wise Breakdown:</b>",
+        "━━━━━━━━━━━━━━━━━━━━━",
+        "<b>Worker-wise Breakdown:</b>",
     ]
     for i, u in enumerate(sorted_users[:25], 1):
         tg = f" ({_esc(u['telegram'])})" if u['telegram'] else ""

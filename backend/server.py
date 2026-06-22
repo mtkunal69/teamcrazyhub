@@ -553,23 +553,35 @@ def _build_xlsx(reports: list, period_label: str, start_dt: datetime, end_dt: da
         ("Total Salary Paid", f"\u20b9{total_paid:,}"),
         ("Success Rate", f"{round(verified/max(len(reports),1)*100,1)}%"),
     ]
-    ws["A4"] = "Metric"; ws["B4"] = "Value"
-    ws["A4"].fill = HDR_FILL; ws["A4"].font = HDR_FONT; ws["A4"].border = BORDER
-    ws["B4"].fill = HDR_FILL; ws["B4"].font = HDR_FONT; ws["B4"].border = BORDER
+    ws["A4"] = "Metric"
+    ws["B4"] = "Value"
+    for col in ("A4", "B4"):
+        ws[col].fill = HDR_FILL
+        ws[col].font = HDR_FONT
+        ws[col].border = BORDER
     for i, (k, v) in enumerate(stats, 5):
-        ws[f"A{i}"] = k; ws[f"B{i}"] = v
-        ws[f"A{i}"].font = Font(bold=True); ws[f"A{i}"].border = BORDER
+        ws[f"A{i}"] = k
+        ws[f"B{i}"] = v
+        ws[f"A{i}"].font = Font(bold=True)
+        ws[f"A{i}"].border = BORDER
         ws[f"B{i}"].border = BORDER
 
     # By worker type
     row = 12
     ws[f"A{row}"] = "By Worker Type"
-    ws[f"A{row}"].font = SUB_FONT; ws[f"A{row}"].fill = SUB_FILL
+    ws[f"A{row}"].font = SUB_FONT
+    ws[f"A{row}"].fill = SUB_FILL
     ws.merge_cells(f"A{row}:D{row}")
     row += 1
-    ws[f"A{row}"] = "Worker Type"; ws[f"B{row}"] = "Reports"; ws[f"C{row}"] = "Total Salary"
+    ws[f"A{row}"] = "Worker Type"
+    ws[f"B{row}"] = "Reports"
+    ws[f"C{row}"] = "Total Salary"
     for c in ("A", "B", "C"):
-        cell = ws[f"{c}{row}"]; cell.fill = HDR_FILL; cell.font = HDR_FONT; cell.border = BORDER; cell.alignment = CENTER
+        cell = ws[f"{c}{row}"]
+        cell.fill = HDR_FILL
+        cell.font = HDR_FONT
+        cell.border = BORDER
+        cell.alignment = CENTER
     row += 1
     for wt in WORKER_TYPES:
         rows_wt = [r for r in reports if r.get("worker_type") == wt]
@@ -585,7 +597,10 @@ def _build_xlsx(reports: list, period_label: str, start_dt: datetime, end_dt: da
     headers = ["Date", "Name", "Telegram", "Worker Type", "Entered Count", "AI Count", "Slab", "Salary (\u20b9)", "Status"]
     for col, h in enumerate(headers, 1):
         cell = ws2.cell(row=1, column=col, value=h)
-        cell.fill = HDR_FILL; cell.font = HDR_FONT; cell.border = BORDER; cell.alignment = CENTER
+        cell.fill = HDR_FILL
+        cell.font = HDR_FONT
+        cell.border = BORDER
+        cell.alignment = CENTER
 
     sorted_reports = sorted(reports, key=lambda x: x.get("created_at", ""), reverse=True)
     for ri, r in enumerate(sorted_reports, 2):
@@ -613,7 +628,10 @@ def _build_xlsx(reports: list, period_label: str, start_dt: datetime, end_dt: da
     ws3 = wb.create_sheet("Worker Breakdown")
     for col, h in enumerate(["Worker", "Telegram", "Reports", "Total Members", "Total Salary (\u20b9)", "Verified", "Mismatches"], 1):
         cell = ws3.cell(row=1, column=col, value=h)
-        cell.fill = HDR_FILL; cell.font = HDR_FONT; cell.border = BORDER; cell.alignment = CENTER
+        cell.fill = HDR_FILL
+        cell.font = HDR_FONT
+        cell.border = BORDER
+        cell.alignment = CENTER
 
     by_user = {}
     for r in reports:
@@ -623,8 +641,10 @@ def _build_xlsx(reports: list, period_label: str, start_dt: datetime, end_dt: da
         d["n"] += 1
         d["members"] += r.get("member_count", 0)
         d["salary"] += r.get("salary", 0)
-        if r.get("status") == "VERIFIED": d["v"] += 1
-        else: d["m"] += 1
+        if r.get("status") == "VERIFIED":
+            d["v"] += 1
+        else:
+            d["m"] += 1
 
     for ri, (_k, u) in enumerate(sorted(by_user.items(), key=lambda x: x[1]["salary"], reverse=True), 2):
         vals = [u["name"], u["tg"], u["n"], u["members"], u["salary"], u["v"], u["m"]]
