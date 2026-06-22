@@ -24,8 +24,8 @@ export function AuthProvider({ children }) {
     return data;
   };
 
-  const loginUser = async (name, telegram) => {
-    const { data } = await api.post("/auth/user/login", { name, telegram });
+  const loginUser = async (username, password) => {
+    const { data } = await api.post("/auth/user/login", { username, password });
     setSession(data);
     setUser(data);
     return data;

@@ -181,19 +181,24 @@ function SubmitTab({ charts, myLinks, onSubmitted, onCreateLink }) {
 }
 
 function LinksTab({ links, onChange }) {
-  const [channel, setChannel] = useState("");
+  const [channels, setChannels] = useState([]);
+  const [channelId, setChannelId] = useState("");
   const [name, setName] = useState("");
   const [creating, setCreating] = useState(false);
   const [err, setErr] = useState("");
   const [copied, setCopied] = useState("");
 
+  useEffect(() => {
+    api.get("/channels/available").then((r) => setChannels(r.data));
+  }, []);
+
   async function create() {
     setErr("");
-    if (!channel.trim()) { setErr("Enter channel @username or ID"); return; }
+    if (!channelId) { setErr("Choose a channel"); return; }
     setCreating(true);
     try {
-      await api.post("/links/create", { channel: channel.trim(), name: name.trim() || null });
-      setChannel(""); setName("");
+      await api.post("/links/create", { channel_id: channelId, name: name.trim() || null });
+      setChannelId(""); setName("");
       onChange();
     } catch (e) {
       setErr(e.response?.data?.detail || "Could not create link");
@@ -215,61 +220,98 @@ function LinksTab({ links, onChange }) {
   return (
     <div>
       <div style={{ background: "#eff6ff", border: "1px solid #bfdbfe", borderLeft: "3px solid #1d4ed8", borderRadius: 11, padding: 16, marginBottom: 22 }}>
-        <div style={{ fontWeight: 800, fontSize: 13, color: "#1d4ed8", marginBottom: 8 }}>📋 Quick Setup</div>
+        <div style={{ fontWeight: 800, fontSize: 13, color: "#1d4ed8", marginBottom: 8 }}>📋 How it works</div>
         <ol style={{ margin: 0, paddingLeft: 18, fontSize: 13, color: "#334155", lineHeight: 1.8 }}>
-          <li>Ask your channel owner to add bot <b>@YourBot</b> as admin with <b>Invite Users</b> permission</li>
-          <li>Enter the channel @username below (e.g. <code style={{ background: "#fff", padding: "1px 6px", borderRadius: 4 }}>@mychannel</code>)</li>
-          <li>Click <b>Generate Link</b> — copy the link and share it</li>
-          <li>Members who join via your link get auto-counted (no manual work)</li>
+          <li>Choose a channel from the admin's list below</li>
+          <li>Click <b>Generate Link</b> — you get a unique invite link</li>
+          <li>Share that link wherever you want to invite people</li>
+          <li>Joins are auto-counted · leaves are tracked too</li>
+          <li>Salary is calculated on <b>net active members</b> (yesterday at 10 AM)</li>
         </ol>
       </div>
 
       <div style={{ background: "#fff", padding: 22, borderRadius: 12, border: "1px solid #e2e8f0", marginBottom: 22 }}>
         <h3 style={{ fontSize: 16, fontWeight: 800, margin: "0 0 14px" }}>Generate New Invite Link</h3>
-        <div style={{ display: "grid", gridTemplateColumns: "2fr 1.5fr auto", gap: 10, alignItems: "end" }}>
-          <label style={lbl}>
-            <span>Channel @username or ID</span>
-            <input data-testid="link-channel-input" value={channel} onChange={(e) => setChannel(e.target.value)} placeholder="@mychannel" style={inp} />
-          </label>
-          <label style={lbl}>
-            <span>Link Name (optional)</span>
-            <input data-testid="link-name-input" value={name} onChange={(e) => setName(e.target.value)} placeholder="e.g. Morning campaign" style={inp} />
-          </label>
-          <button data-testid="link-create-btn" disabled={creating} onClick={create} style={{ ...btnPrimary, height: 44 }}>
-            {creating ? "Creating..." : "Generate Link →"}
-          </button>
-        </div>
-        {err && <div data-testid="link-error" style={{ marginTop: 10, padding: "9px 12px", borderRadius: 8, background: "#fef2f2", color: "#b91c1c", fontSize: 13, fontWeight: 600, border: "1px solid #fecaca" }}>{err}</div>}
+        {channels.length === 0 ? (
+          <div style={{ padding: 18, background: "#fef3c7", border: "1px solid #fde68a", borderRadius: 9, color: "#92400e", fontSize: 13, fontWeight: 600 }}>
+            ⚠ No channels available. Admin needs to add channels first.
+          </div>
+        ) : (
+          <>
+            <div style={{ display: "grid", gridTemplateColumns: "2fr 1.5fr auto", gap: 10, alignItems: "end" }}>
+              <label style={lbl}>
+                <span>Channel</span>
+                <select data-testid="link-channel-select" value={channelId} onChange={(e) => setChannelId(e.target.value)} style={inp}>
+                  <option value="">-- Choose channel --</option>
+                  {channels.map((c) => (
+                    <option key={c.id} value={c.id}>{c.title} ({c.type || "channel"})</option>
+                  ))}
+                </select>
+              </label>
+              <label style={lbl}>
+                <span>Link Name (optional)</span>
+                <input data-testid="link-name-input" value={name} onChange={(e) => setName(e.target.value)} placeholder="e.g. Campaign 1" style={inp} />
+              </label>
+              <button data-testid="link-create-btn" disabled={creating} onClick={create} style={{ ...btnPrimary, height: 44 }}>
+                {creating ? "Creating..." : "Generate →"}
+              </button>
+            </div>
+            {err && <div data-testid="link-error" style={{ marginTop: 10, padding: "9px 12px", borderRadius: 8, background: "#fef2f2", color: "#b91c1c", fontSize: 13, fontWeight: 600, border: "1px solid #fecaca" }}>{err}</div>}
+          </>
+        )}
       </div>
 
       <h3 style={{ fontSize: 15, fontWeight: 800, color: "#334155", margin: "0 0 12px" }}>Your Links ({links.length})</h3>
       {links.length === 0 ? (
-        <div style={{ background: "#fff", padding: 36, textAlign: "center", color: "#94a3b8", borderRadius: 12, border: "1px solid #e2e8f0" }}>
-          No links yet. Generate your first one above.
-        </div>
+        <div style={{ background: "#fff", padding: 36, textAlign: "center", color: "#94a3b8", borderRadius: 12, border: "1px solid #e2e8f0" }}>No links yet.</div>
       ) : (
         <div style={{ display: "grid", gap: 12 }}>
-          {links.map((l) => (
-            <div key={l.id} data-testid={`link-row-${l.id}`} style={{ background: "#fff", padding: 18, borderRadius: 12, border: "1px solid #e2e8f0" }}>
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "start", marginBottom: 12 }}>
-                <div style={{ flex: 1 }}>
-                  <div style={{ fontWeight: 800, fontSize: 15, marginBottom: 2 }}>{l.channel_title}</div>
-                  <div style={{ fontSize: 11, color: "#64748b" }}>{l.link_name} · Created {fmtDate(l.created_at)}</div>
-                </div>
-                <div style={{ textAlign: "right" }}>
-                  <div style={{ fontSize: 26, fontWeight: 900, color: "#10b981" }}>{l.members_joined}</div>
-                  <div style={{ fontSize: 10, color: "#64748b", fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.06em" }}>Members Joined</div>
-                </div>
+          {links.map((l) => <LinkRow key={l.id} l={l} copied={copied} onCopy={copy} onDelete={del} />)}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function LinkRow({ l, copied, onCopy, onDelete }) {
+  const [details, setDetails] = useState(null);
+  const [open, setOpen] = useState(false);
+  useEffect(() => {
+    if (open && !details) {
+      api.get(`/links/${l.id}/members`).then((r) => setDetails(r.data));
+    }
+  }, [open, l.id, details]);
+  return (
+    <div data-testid={`link-row-${l.id}`} style={{ background: "#fff", padding: 18, borderRadius: 12, border: "1px solid #e2e8f0" }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "start", marginBottom: 12 }}>
+        <div style={{ flex: 1 }}>
+          <div style={{ fontWeight: 800, fontSize: 15, marginBottom: 2 }}>{l.channel_title}</div>
+          <div style={{ fontSize: 11, color: "#64748b" }}>{l.link_name} · Created {fmtDate(l.created_at)}</div>
+        </div>
+        <div style={{ textAlign: "right" }}>
+          <div style={{ fontSize: 26, fontWeight: 900, color: "#10b981" }}>{l.members_joined}</div>
+          <div style={{ fontSize: 10, color: "#64748b", fontWeight: 700, textTransform: "uppercase" }}>Total Joins</div>
+        </div>
+      </div>
+      <div style={{ display: "flex", gap: 8, alignItems: "center", padding: "10px 12px", background: "#f8fafc", borderRadius: 8, border: "1px solid #e2e8f0" }}>
+        <code style={{ flex: 1, fontSize: 12, color: "#0f172a", wordBreak: "break-all", fontFamily: "monospace" }}>{l.link_url}</code>
+        <button data-testid={`link-copy-${l.id}`} onClick={() => onCopy(l.link_url, l.id)} style={{ padding: "6px 12px", background: copied === l.id ? "#10b981" : "#1d4ed8", color: "#fff", border: "none", borderRadius: 6, fontWeight: 700, fontSize: 11, cursor: "pointer" }}>{copied === l.id ? "✓ Copied" : "📋 Copy"}</button>
+        <button data-testid={`link-toggle-${l.id}`} onClick={() => setOpen((p) => !p)} style={{ padding: "6px 10px", background: "#f1f5f9", color: "#475569", border: "none", borderRadius: 6, fontWeight: 700, fontSize: 11, cursor: "pointer" }}>{open ? "▴" : "▾"}</button>
+        <button data-testid={`link-delete-${l.id}`} onClick={() => onDelete(l.id)} style={{ padding: "6px 10px", background: "#fef2f2", color: "#b91c1c", border: "1px solid #fecaca", borderRadius: 6, fontWeight: 700, fontSize: 11, cursor: "pointer" }}>✕</button>
+      </div>
+      {open && details && (
+        <div style={{ marginTop: 10, padding: 12, background: "#f8fafc", borderRadius: 8, border: "1px solid #e2e8f0" }}>
+          <div style={{ display: "flex", gap: 16, marginBottom: 10, fontSize: 12, fontWeight: 700 }}>
+            <span style={{ color: "#10b981" }}>✓ Active: {details.active}</span>
+            <span style={{ color: "#ef4444" }}>✕ Left: {details.left}</span>
+          </div>
+          <div style={{ maxHeight: 200, overflow: "auto", display: "grid", gap: 4 }}>
+            {details.members.slice(0, 30).map((m, i) => (
+              <div key={i} style={{ fontSize: 12, padding: "5px 8px", background: m.left_at ? "#fef2f2" : "#ecfdf5", borderRadius: 6, color: m.left_at ? "#991b1b" : "#047857" }}>
+                {m.first_name || m.username || `User ${m.telegram_user_id}`} {m.left_at && <span style={{ fontSize: 10, marginLeft: 6 }}>(left)</span>}
               </div>
-              <div style={{ display: "flex", gap: 8, alignItems: "center", padding: "10px 12px", background: "#f8fafc", borderRadius: 8, border: "1px solid #e2e8f0" }}>
-                <code style={{ flex: 1, fontSize: 12, color: "#0f172a", wordBreak: "break-all", fontFamily: "monospace" }}>{l.link_url}</code>
-                <button data-testid={`link-copy-${l.id}`} onClick={() => copy(l.link_url, l.id)} style={{ padding: "6px 12px", background: copied === l.id ? "#10b981" : "#1d4ed8", color: "#fff", border: "none", borderRadius: 6, fontWeight: 700, fontSize: 11, cursor: "pointer" }}>
-                  {copied === l.id ? "✓ Copied" : "📋 Copy"}
-                </button>
-                <button data-testid={`link-delete-${l.id}`} onClick={() => del(l.id)} style={{ padding: "6px 10px", background: "#fef2f2", color: "#b91c1c", border: "1px solid #fecaca", borderRadius: 6, fontWeight: 700, fontSize: 11, cursor: "pointer" }}>✕</button>
-              </div>
-            </div>
-          ))}
+            ))}
+          </div>
         </div>
       )}
     </div>

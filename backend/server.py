@@ -131,8 +131,28 @@ class AdminLogin(BaseModel):
     password: str
 
 class UserLogin(BaseModel):
-    name: str
-    telegram: str  # e.g. @username
+    username: str
+    password: str
+
+class UserSignup(BaseModel):
+    username: str  # platform username (login)
+    password: str
+    name: str  # full name
+    telegram: str  # @handle
+    default_worker_type: str = "5 ID Worker"
+
+class ChannelIn(BaseModel):
+    chat_id: Optional[str] = None  # numeric ID or @username
+    invite_link: Optional[str] = None  # e.g. https://t.me/+abc or https://t.me/channelname
+    title_override: Optional[str] = None  # admin can override display name
+    default_worker_type: Optional[str] = None
+    notes: Optional[str] = None
+
+class ChannelPatch(BaseModel):
+    title_override: Optional[str] = None
+    default_worker_type: Optional[str] = None
+    notes: Optional[str] = None
+    enabled: Optional[bool] = None
 
 class SlabIn(BaseModel):
     worker_type: str
@@ -235,11 +255,23 @@ async def seed_slabs():
 
 async def ensure_indexes():
     await db.admins.create_index("username", unique=True)
-    await db.users.create_index("telegram", unique=True)
+    # Drop legacy indexes on users (telegram unique → migrate to sparse + add username unique)
+    try:
+        existing = await db.users.index_information()
+        if "telegram_1" in existing and existing["telegram_1"].get("unique"):
+            await db.users.drop_index("telegram_1")
+    except Exception:
+        pass
+    await db.users.create_index("username", unique=True, sparse=True)
+    await db.users.create_index("telegram", sparse=True)
     await db.salary_slabs.create_index([("worker_type", 1), ("order", 1)])
     await db.reports.create_index([("created_at", -1)])
     await db.reports.create_index("telegram")
     await db.audit_logs.create_index([("created_at", -1)])
+    await db.channels.create_index("chat_id", unique=True, sparse=True)
+    await db.invite_links.create_index("link_url", unique=True, sparse=True)
+    await db.link_members.create_index([("link_id", 1), ("telegram_user_id", 1)], unique=True)
+    await db.link_members.create_index([("channel_id", 1), ("telegram_user_id", 1)])
 
 # ─────────────────────────────────────────────────────────────
 # Salary calc
@@ -265,29 +297,43 @@ async def admin_login(body: AdminLogin):
     token = make_token(a["id"], "admin", a["name"])
     return {"token": token, "role": "admin", "name": a["name"], "username": a["username"]}
 
-@api.post("/auth/user/login")
-async def user_login(body: UserLogin):
-    name = body.name.strip()
+@api.post("/auth/user/register")
+async def user_register(body: UserSignup):
+    uname = body.username.strip().lower()
+    if len(uname) < 3:
+        raise HTTPException(400, "Username must be at least 3 characters")
+    if len(body.password) < 6:
+        raise HTTPException(400, "Password must be at least 6 characters")
+    if await db.users.find_one({"username": uname}):
+        raise HTTPException(409, "Username already taken")
     tg = body.telegram.strip()
     if not tg.startswith("@"):
         tg = "@" + tg
-    if not name or len(tg) < 2:
-        raise HTTPException(400, "Name and telegram required")
-    existing = await db.users.find_one({"telegram": tg})
-    if not existing:
-        user = {
-            "id": str(uuid.uuid4()),
-            "name": name,
-            "telegram": tg,
-            "created_at": now_iso(),
-            "last_login": now_iso(),
-        }
-        await db.users.insert_one(user)
-    else:
-        await db.users.update_one({"telegram": tg}, {"$set": {"name": name, "last_login": now_iso()}})
-        user = await db.users.find_one({"telegram": tg}, {"_id": 0})
-    token = make_token(user["id"], "user", name)
-    return {"token": token, "role": "user", "name": name, "telegram": tg, "user_id": user["id"]}
+    if body.default_worker_type not in WORKER_TYPES:
+        raise HTTPException(400, "Invalid worker type")
+    user = {
+        "id": str(uuid.uuid4()),
+        "username": uname,
+        "password_hash": hash_pw(body.password),
+        "name": body.name.strip(),
+        "telegram": tg,
+        "default_worker_type": body.default_worker_type,
+        "created_at": now_iso(),
+        "last_login": now_iso(),
+    }
+    await db.users.insert_one(user)
+    token = make_token(user["id"], "user", user["name"])
+    return {"token": token, "role": "user", "name": user["name"], "username": uname, "telegram": tg, "user_id": user["id"]}
+
+@api.post("/auth/user/login")
+async def user_login(body: UserLogin):
+    uname = body.username.strip().lower()
+    u = await db.users.find_one({"username": uname})
+    if not u or not u.get("password_hash") or not verify_pw(body.password, u["password_hash"]):
+        raise HTTPException(401, "Invalid username or password")
+    await db.users.update_one({"id": u["id"]}, {"$set": {"last_login": now_iso()}})
+    token = make_token(u["id"], "user", u["name"])
+    return {"token": token, "role": "user", "name": u["name"], "username": uname, "telegram": u["telegram"], "user_id": u["id"]}
 
 @api.get("/auth/me")
 async def me(p: dict = Depends(get_principal)):
@@ -922,24 +968,175 @@ async def telegram_webhook(request: Request):
 
     if "chat_join_request" in update:
         req = update["chat_join_request"]
-        chat_id = req.get("chat", {}).get("id")
-        user_id = req.get("from", {}).get("id")
+        chat = req.get("chat", {})
+        chat_id = chat.get("id")
+        from_user = req.get("from", {})
+        user_id = from_user.get("id")
         link_url = (req.get("invite_link") or {}).get("invite_link", "")
 
         if chat_id and user_id and link_url:
             link = await db.invite_links.find_one({"link_url": link_url})
             if link:
+                # Record member entry (idempotent)
+                await db.link_members.update_one(
+                    {"link_id": link["id"], "telegram_user_id": user_id},
+                    {"$set": {
+                        "link_id": link["id"],
+                        "channel_id": chat_id,
+                        "telegram_user_id": user_id,
+                        "first_name": from_user.get("first_name", ""),
+                        "username": from_user.get("username"),
+                        "joined_at": now_iso(),
+                        "left_at": None,
+                    }},
+                    upsert=True,
+                )
                 await db.invite_links.update_one(
                     {"id": link["id"]},
                     {"$inc": {"members_joined": 1}, "$set": {"last_join_at": now_iso()}},
                 )
                 if token:
                     await tg_approve_join(token, chat_id, user_id)
-                log.info(f"+1 member via link {link.get('link_name')} (total: {link.get('members_joined',0)+1})")
+                log.info(f"+1 member via link {link.get('link_name')}")
+
+    # Track member leaves
+    if "chat_member" in update:
+        cm = update["chat_member"]
+        chat_id = cm.get("chat", {}).get("id")
+        new_status = cm.get("new_chat_member", {}).get("status")
+        user_id = cm.get("new_chat_member", {}).get("user", {}).get("id")
+        if chat_id and user_id and new_status in ("left", "kicked", "restricted"):
+            res = await db.link_members.update_many(
+                {"channel_id": chat_id, "telegram_user_id": user_id, "left_at": None},
+                {"$set": {"left_at": now_iso()}},
+            )
+            if res.modified_count:
+                log.info(f"Member {user_id} left chat {chat_id} ({res.modified_count} link entries marked)")
+
     return {"ok": True}
 
 # ─────────────────────────────────────────────────────────────
-# Routes — Invite Links
+# Routes — Channels (Admin-managed)
+# ─────────────────────────────────────────────────────────────
+async def _resolve_chat(token: str, chat_id_or_username: str) -> dict:
+    """Try to resolve a chat by ID or @username via Telegram getChat."""
+    return await tg_get_chat(token, chat_id_or_username)
+
+def _extract_chat_id_from_invite(invite_link: str) -> Optional[str]:
+    """Best-effort: extract chat info hint from invite link.
+    t.me/+abc123  → private (need getChat with link)
+    t.me/channelname → public, can use @channelname
+    """
+    if not invite_link:
+        return None
+    s = invite_link.strip()
+    s = s.replace("https://", "").replace("http://", "")
+    if s.startswith("t.me/"):
+        s = s[5:]
+    if s.startswith("+"):
+        return None  # private — admin must use chat_id directly
+    return "@" + s.split("/")[0].split("?")[0]
+
+@api.get("/channels")
+async def list_channels(admin: dict = Depends(require_admin)):
+    rows = await db.channels.find({}, {"_id": 0}).sort("added_at", -1).to_list(500)
+    return rows
+
+@api.get("/channels/available")
+async def available_channels(p: dict = Depends(require_user)):
+    """Channels users can pick from (bot must be admin in them)."""
+    rows = await db.channels.find(
+        {"enabled": {"$ne": False}, "bot_status": {"$in": ["administrator", "member"]}},
+        {"_id": 0},
+    ).sort("title", 1).to_list(500)
+    return rows
+
+@api.post("/channels")
+async def add_channel(body: ChannelIn, admin: dict = Depends(require_admin)):
+    cfg = await db.settings.find_one({"key": "telegram"}, {"_id": 0})
+    if not cfg or not cfg.get("bot_token"):
+        raise HTTPException(400, "Configure Telegram bot first")
+    token = cfg["bot_token"]
+
+    # Determine lookup key
+    lookup = None
+    if body.chat_id:
+        lookup = body.chat_id.strip()
+    elif body.invite_link:
+        lookup = _extract_chat_id_from_invite(body.invite_link)
+        if not lookup:
+            raise HTTPException(400, "Private invite link — please use numeric chat_id instead (bot logs / @userinfobot)")
+    else:
+        raise HTTPException(400, "Provide chat_id or invite_link")
+
+    res = await tg_get_chat(token, lookup)
+    if not res.get("ok"):
+        err = res.get("error", "")
+        raise HTTPException(400, f"Could not find chat: {err}. Make sure bot is admin in that channel.")
+
+    chat = res["result"]
+    chat_id = chat["id"]
+    title = body.title_override or chat.get("title") or chat.get("username") or str(chat_id)
+
+    # Check bot status
+    try:
+        async with httpx.AsyncClient(timeout=15) as cli:
+            r = await cli.post(
+                f"https://api.telegram.org/bot{token}/getChatMember",
+                json={"chat_id": chat_id, "user_id": (await tg_get_me(token)).get("result", {}).get("id")},
+            )
+            mem_data = r.json()
+            bot_status = mem_data.get("result", {}).get("status", "unknown") if mem_data.get("ok") else "unknown"
+    except Exception:
+        bot_status = "unknown"
+
+    doc = {
+        "id": str(uuid.uuid4()),
+        "chat_id": chat_id,
+        "title": title,
+        "original_title": chat.get("title"),
+        "username": chat.get("username"),
+        "type": chat.get("type"),
+        "default_worker_type": body.default_worker_type,
+        "notes": body.notes,
+        "bot_status": bot_status,
+        "enabled": True,
+        "added_by": admin["name"],
+        "added_at": now_iso(),
+    }
+    try:
+        await db.channels.insert_one(doc)
+    except Exception:
+        raise HTTPException(409, "Channel already added")
+    doc.pop("_id", None)
+    return doc
+
+@api.put("/channels/{cid}")
+async def edit_channel(cid: str, body: ChannelPatch, admin: dict = Depends(require_admin)):
+    ch = await db.channels.find_one({"id": cid}, {"_id": 0})
+    if not ch:
+        raise HTTPException(404, "Channel not found")
+    upd = {k: v for k, v in body.model_dump().items() if v is not None}
+    if "title_override" in upd:
+        upd["title"] = upd.pop("title_override")
+    upd["updated_at"] = now_iso()
+    upd["updated_by"] = admin["name"]
+    await db.channels.update_one({"id": cid}, {"$set": upd})
+    return {"ok": True}
+
+@api.delete("/channels/{cid}")
+async def delete_channel(cid: str, admin: dict = Depends(require_admin)):
+    ch = await db.channels.find_one({"id": cid}, {"_id": 0})
+    if not ch:
+        raise HTTPException(404, "Channel not found")
+    # Delete related links
+    await db.invite_links.delete_many({"channel_id": ch["chat_id"]})
+    await db.link_members.delete_many({"channel_id": ch["chat_id"]})
+    await db.channels.delete_one({"id": cid})
+    return {"ok": True}
+
+# ─────────────────────────────────────────────────────────────
+# Routes — Invite Links (use admin's channel list)
 # ─────────────────────────────────────────────────────────────
 @api.get("/links/me")
 async def my_links(p: dict = Depends(require_user)):
@@ -947,52 +1144,44 @@ async def my_links(p: dict = Depends(require_user)):
 
 @api.get("/links")
 async def all_links(admin: dict = Depends(require_admin)):
-    return await db.invite_links.find({}, {"_id": 0}).sort("created_at", -1).to_list(1000)
-
-@api.get("/channels")
-async def list_channels(admin: dict = Depends(require_admin)):
-    return await db.channels.find(
-        {"bot_status": {"$in": ["administrator", "member"]}}, {"_id": 0},
-    ).sort("added_at", -1).to_list(100)
+    return await db.invite_links.find({}, {"_id": 0}).sort("created_at", -1).to_list(2000)
 
 @api.post("/links/create")
-async def create_link(body: LinkCreateIn, p: dict = Depends(require_user)):
+async def create_link(body: dict, p: dict = Depends(require_user)):
+    """User picks a channel_id (from admin's list)."""
+    channel_id = body.get("channel_id")
+    name = (body.get("name") or "").strip()
+    if not channel_id:
+        raise HTTPException(400, "Select a channel")
+    ch = await db.channels.find_one({"id": channel_id}, {"_id": 0})
+    if not ch:
+        raise HTTPException(404, "Channel not found in admin list")
+    if ch.get("enabled") is False:
+        raise HTTPException(400, "Channel is disabled by admin")
+
     cfg = await db.settings.find_one({"key": "telegram"}, {"_id": 0})
     if not cfg or not cfg.get("bot_token"):
-        raise HTTPException(400, "Telegram bot not configured. Ask admin to set it up.")
+        raise HTTPException(400, "Telegram bot not configured")
     token = cfg["bot_token"]
-    channel = body.channel.strip()
-    if not channel:
-        raise HTTPException(400, "Channel is required")
-    chat_resp = await tg_get_chat(token, channel)
-    if not chat_resp.get("ok"):
-        err = chat_resp.get("error", "")
-        if "chat not found" in err.lower():
-            raise HTTPException(400, "Channel not found. Make sure bot is added as admin in that channel.")
-        raise HTTPException(400, f"Could not resolve channel: {err}")
-
-    chat = chat_resp["result"]
-    chat_id = chat["id"]
-    chat_title = chat.get("title") or chat.get("username") or str(chat_id)
-
     user = await db.users.find_one({"id": p["sub"]}, {"_id": 0})
-    link_name = (body.name or f"{user['name']}'s Link")[:32]
-    link_resp = await tg_create_invite(token, chat_id, name=link_name, creates_join_request=True)
-    if not link_resp.get("ok"):
-        err = link_resp.get("error", "")
+    link_name = (name or f"{user['name']}'s Link")[:32]
+    res = await tg_create_invite(token, ch["chat_id"], name=link_name, creates_join_request=True)
+    if not res.get("ok"):
+        err = res.get("error", "")
         if "rights" in err.lower() or "not enough" in err.lower():
-            raise HTTPException(400, "Bot is not admin in that channel OR lacks 'Invite Users' permission")
+            raise HTTPException(400, "Bot lacks 'Invite Users' permission in this channel")
         raise HTTPException(400, f"Could not create link: {err}")
 
-    invite = link_resp["result"]
+    invite = res["result"]
     doc = {
         "id": str(uuid.uuid4()),
         "staff_user_id": p["sub"],
+        "staff_username": user.get("username"),
         "staff_name": user["name"],
         "staff_telegram": user["telegram"],
-        "channel_id": chat_id,
-        "channel_title": chat_title,
-        "channel_username": chat.get("username"),
+        "channel_id": ch["chat_id"],
+        "channel_db_id": ch["id"],
+        "channel_title": ch["title"],
         "link_url": invite["invite_link"],
         "link_name": link_name,
         "members_joined": 0,
@@ -1000,15 +1189,6 @@ async def create_link(body: LinkCreateIn, p: dict = Depends(require_user)):
         "active": True,
     }
     await db.invite_links.insert_one(doc)
-    await db.channels.update_one(
-        {"chat_id": chat_id},
-        {"$set": {
-            "chat_id": chat_id, "title": chat_title,
-            "username": chat.get("username"), "type": chat.get("type"),
-            "bot_status": "administrator", "added_at": now_iso(),
-        }},
-        upsert=True,
-    )
     doc.pop("_id", None)
     return doc
 
@@ -1020,8 +1200,22 @@ async def delete_link(lid: str, p: dict = Depends(require_user)):
     cfg = await db.settings.find_one({"key": "telegram"}, {"_id": 0})
     if cfg and cfg.get("bot_token"):
         await tg_revoke_invite(cfg["bot_token"], link["channel_id"], link["link_url"])
-    await db.invite_links.delete_one({"id": lid})
+    await db.invite_links.delete_many({"id": lid})
+    await db.link_members.delete_many({"link_id": lid})
     return {"ok": True}
+
+@api.get("/links/{lid}/members")
+async def link_members(lid: str, p: dict = Depends(get_principal)):
+    """Live members of a link with join/leave status."""
+    link = await db.invite_links.find_one({"id": lid}, {"_id": 0})
+    if not link:
+        raise HTTPException(404, "Not found")
+    if p["role"] == "user" and link["staff_user_id"] != p["sub"]:
+        raise HTTPException(403, "Not yours")
+    rows = await db.link_members.find({"link_id": lid}, {"_id": 0}).sort("joined_at", -1).to_list(2000)
+    active = sum(1 for r in rows if r.get("left_at") is None)
+    left = len(rows) - active
+    return {"link": link, "active": active, "left": left, "members": rows}
 
 # ─────────────────────────────────────────────────────────────
 # Daily summary scheduler (12 PM IST)
@@ -1037,7 +1231,6 @@ async def run_daily_summary_job(force: bool = False):
     if not force and not cfg.get("daily_summary", True):
         log.info("Daily summary skipped: daily_summary off")
         return
-    # Collect reports from last 24h (IST window: yesterday 12 PM to today 12 PM)
     now_utc = datetime.now(timezone.utc)
     since_utc = now_utc - timedelta(hours=24)
     rows = await db.reports.find(
@@ -1048,6 +1241,84 @@ async def run_daily_summary_job(force: bool = False):
     msg = build_daily_summary(rows, date_str)
     res = await tg_send(db, msg)
     log.info(f"Daily summary sent: {res}")
+
+
+async def run_daily_auto_reports(force: bool = False):
+    """At 10 AM IST: for each user, count yesterday's NET active members
+    (joined yesterday AND still in chat at 10 AM today) per link, calculate
+    salary using their default_worker_type, create AUTO report.
+    """
+    log.info("Running 10 AM IST auto-report job...")
+    now_ist = datetime.now(IST)
+    period_end = now_ist.replace(hour=10, minute=0, second=0, microsecond=0)
+    if now_ist < period_end:
+        period_end = period_end - timedelta(days=1)
+    period_start = period_end - timedelta(days=1)
+    period_end_utc = period_end.astimezone(timezone.utc).isoformat()
+    period_start_utc = period_start.astimezone(timezone.utc).isoformat()
+    log.info(f"Period: {period_start_utc} → {period_end_utc}")
+
+    users = await db.users.find({"username": {"$exists": True}}, {"_id": 0}).to_list(1000)
+    reports_created = 0
+    for user in users:
+        # All this user's links
+        links = await db.invite_links.find({"staff_user_id": user["id"]}, {"_id": 0}).to_list(100)
+        if not links:
+            continue
+        link_ids = [l["id"] for l in links]
+        # Net active = joined in period AND (left_at is null OR left_at > period_end)
+        active_count = await db.link_members.count_documents({
+            "link_id": {"$in": link_ids},
+            "joined_at": {"$gte": period_start_utc, "$lt": period_end_utc},
+            "$or": [{"left_at": None}, {"left_at": {"$gte": period_end_utc}}],
+        })
+        total_joined = await db.link_members.count_documents({
+            "link_id": {"$in": link_ids},
+            "joined_at": {"$gte": period_start_utc, "$lt": period_end_utc},
+        })
+        left_count = total_joined - active_count
+        if total_joined == 0:
+            continue  # skip users with no joins in period
+        worker_type = user.get("default_worker_type", "5 ID Worker")
+        salary, slab = await calc_salary(worker_type, active_count)
+        doc = {
+            "id": str(uuid.uuid4()),
+            "user_id": user["id"],
+            "name": user["name"],
+            "telegram": user.get("telegram", ""),
+            "worker_type": worker_type,
+            "member_count": active_count,
+            "ai_count": active_count,
+            "joined_count": total_joined,
+            "left_count": left_count,
+            "source": "AUTO_10AM",
+            "channel_title": "Multiple" if len(links) > 1 else links[0]["channel_title"],
+            "salary": salary,
+            "status": "VERIFIED",
+            "slab_label": slab,
+            "period_start": period_start_utc,
+            "period_end": period_end_utc,
+            "created_at": now_iso(),
+        }
+        await db.reports.insert_one(doc)
+        reports_created += 1
+        log.info(f"AUTO report for {user['name']}: {active_count} active ({left_count} left), ₹{salary}")
+        # Telegram notify
+        try:
+            tg_cfg = await tg_get_config(db)
+            if tg_cfg and tg_cfg.get("enabled") and tg_cfg.get("notify_on_report", True):
+                doc.pop("_id", None)
+                await tg_send(db, build_report_notification(doc))
+        except Exception:
+            pass
+    log.info(f"Auto-report job complete: {reports_created} reports created")
+
+
+@api.post("/settings/run-auto-reports-now")
+async def trigger_auto_reports(admin: dict = Depends(require_admin)):
+    """Manual trigger for the 10 AM auto-report job."""
+    await run_daily_auto_reports(force=True)
+    return {"ok": True}
 
 # ─────────────────────────────────────────────────────────────
 # App wiring
@@ -1070,13 +1341,19 @@ async def on_start():
     global scheduler
     scheduler = AsyncIOScheduler(timezone=IST)
     scheduler.add_job(
+        run_daily_auto_reports,
+        CronTrigger(hour=10, minute=0, timezone=IST),
+        id="daily_auto_reports",
+        replace_existing=True,
+    )
+    scheduler.add_job(
         run_daily_summary_job,
         CronTrigger(hour=12, minute=0, timezone=IST),
         id="daily_salary_summary",
         replace_existing=True,
     )
     scheduler.start()
-    log.info("TeamCrazy Hub API ready · Daily summary scheduled @ 12:00 IST")
+    log.info("TeamCrazy Hub API ready · Auto-reports @ 10 AM IST · Telegram summary @ 12 PM IST")
 
 @app.on_event("shutdown")
 async def on_stop():

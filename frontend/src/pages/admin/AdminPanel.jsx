@@ -15,10 +15,10 @@ const NAV = [
   { id: "dashboard", icon: "🏠", label: "Dashboard" },
   { id: "reports", icon: "📋", label: "Staff Reports" },
   { id: "charts", icon: "📊", label: "Salary Charts" },
+  { id: "channels", icon: "📺", label: "Channels" },
   { id: "simulator", icon: "🧮", label: "Simulator" },
   { id: "audit", icon: "🔍", label: "Audit Log" },
   { id: "telegram", icon: "📨", label: "Telegram Bot" },
-  { id: "gemini", icon: "🧠", label: "Gemini AI" },
 ];
 
 export default function AdminPanel() {
@@ -96,7 +96,7 @@ export default function AdminPanel() {
           {page === "simulator" && <Simulator charts={charts} />}
           {page === "audit" && <Audit />}
           {page === "telegram" && <TelegramSettings showToast={showToast} />}
-          {page === "gemini" && <GeminiSettings showToast={showToast} />}
+          {page === "channels" && <ChannelsAdmin showToast={showToast} /> }
         </main>
       </div>
 
@@ -750,7 +750,141 @@ function Toggle({ label, sub, v, onChange, ...rest }) {
 
 const codeS = { background: C.bg, padding: "1px 6px", borderRadius: 4, fontSize: 11, color: C.accent, fontFamily: "monospace" };
 
-// ─── GEMINI AI SETTINGS ──────────────────────────────────────
+// ─── CHANNELS ADMIN ──────────────────────────────────────────
+function ChannelsAdmin({ showToast }) {
+  const [chs, setChs] = useState([]);
+  const [chatInput, setChatInput] = useState("");
+  const [linkInput, setLinkInput] = useState("");
+  const [titleOv, setTitleOv] = useState("");
+  const [adding, setAdding] = useState(false);
+  const [err, setErr] = useState("");
+
+  const reload = () => api.get("/channels").then((r) => setChs(r.data));
+  useEffect(() => { reload(); }, []);
+
+  async function add() {
+    setErr("");
+    if (!chatInput.trim() && !linkInput.trim()) { setErr("Provide chat_id OR invite link"); return; }
+    setAdding(true);
+    try {
+      await api.post("/channels", {
+        chat_id: chatInput.trim() || null,
+        invite_link: linkInput.trim() || null,
+        title_override: titleOv.trim() || null,
+      });
+      setChatInput(""); setLinkInput(""); setTitleOv("");
+      reload();
+      showToast("✓ Channel added");
+    } catch (e) {
+      setErr(e.response?.data?.detail || "Could not add channel");
+    } finally { setAdding(false); }
+  }
+
+  async function toggleEnabled(c) {
+    await api.put(`/channels/${c.id}`, { enabled: !c.enabled });
+    reload();
+    showToast(c.enabled ? "Channel disabled" : "Channel enabled", "amber");
+  }
+
+  async function editTitle(c) {
+    const newTitle = window.prompt("New display title:", c.title);
+    if (!newTitle) return;
+    await api.put(`/channels/${c.id}`, { title_override: newTitle });
+    reload();
+    showToast("Updated", "success");
+  }
+
+  async function del(c) {
+    if (!window.confirm(`Delete "${c.title}"? All staff links + member data for this channel will be removed.`)) return;
+    await api.delete(`/channels/${c.id}`);
+    reload();
+    showToast("Channel removed", "error");
+  }
+
+  return (
+    <div>
+      <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 18 }}>
+        <div>
+          <h1 style={{ fontSize: 28, fontWeight: 900, margin: "0 0 4px" }}>📺 Channels</h1>
+          <p style={{ color: C.muted, fontSize: 13, margin: 0 }}>Manage Telegram channels where staff generate invite links.</p>
+        </div>
+      </div>
+
+      <div style={{ background: C.accentDim, border: `1px solid ${C.accent}40`, borderLeft: `3px solid ${C.accent}`, borderRadius: 10, padding: 16, marginBottom: 22 }}>
+        <div style={{ fontWeight: 800, fontSize: 13, color: C.accent, marginBottom: 8 }}>How to add a channel</div>
+        <ol style={{ margin: 0, paddingLeft: 18, fontSize: 12, color: C.text, lineHeight: 1.8 }}>
+          <li>Add the bot as <b>Admin</b> in your Telegram channel with <b>"Invite Users"</b> permission</li>
+          <li>Below, enter either: <b>Chat ID</b> (e.g. <code style={codeS}>-1001234567890</code>) OR <b>Invite Link</b> (e.g. <code style={codeS}>https://t.me/yourchannel</code>)</li>
+          <li>Get chat ID from <code style={codeS}>@userinfobot</code> after forwarding any message from your channel to it</li>
+        </ol>
+      </div>
+
+      <div style={{ background: C.card, padding: 18, borderRadius: 11, border: `1px solid ${C.border}`, marginBottom: 22 }}>
+        <h3 style={{ fontSize: 14, fontWeight: 800, margin: "0 0 12px" }}>Add New Channel</h3>
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr auto", gap: 10, alignItems: "end" }}>
+          <label style={{ display: "grid", gap: 5 }}>
+            <span style={{ fontSize: 11, color: C.muted, fontWeight: 700 }}>Chat ID</span>
+            <input data-testid="ch-chatid-input" value={chatInput} onChange={(e) => setChatInput(e.target.value)} placeholder="-1001234567890 or @username" style={dkInp} />
+          </label>
+          <label style={{ display: "grid", gap: 5 }}>
+            <span style={{ fontSize: 11, color: C.muted, fontWeight: 700 }}>OR Invite Link</span>
+            <input data-testid="ch-invitelink-input" value={linkInput} onChange={(e) => setLinkInput(e.target.value)} placeholder="https://t.me/channelname" style={dkInp} />
+          </label>
+          <label style={{ display: "grid", gap: 5 }}>
+            <span style={{ fontSize: 11, color: C.muted, fontWeight: 700 }}>Display Title (optional)</span>
+            <input data-testid="ch-title-input" value={titleOv} onChange={(e) => setTitleOv(e.target.value)} placeholder="Friendly name" style={dkInp} />
+          </label>
+          <button data-testid="ch-add-btn" disabled={adding} onClick={add} style={{ ...btnPrimary, height: 38 }}>{adding ? "Adding..." : "+ Add"}</button>
+        </div>
+        {err && <div style={{ marginTop: 10, padding: "9px 12px", borderRadius: 7, background: C.redDim, color: C.red, fontSize: 12, fontWeight: 600 }}>{err}</div>}
+      </div>
+
+      <div style={{ background: C.card, borderRadius: 11, border: `1px solid ${C.border}`, overflow: "auto" }}>
+        <table style={{ width: "100%", borderCollapse: "collapse" }}>
+          <thead style={{ background: C.surface }}>
+            <tr>
+              {["Channel", "Chat ID", "Type", "Bot Status", "Enabled", "Actions"].map((h) => (
+                <th key={h} style={{ padding: "10px 14px", textAlign: "left", fontSize: 10, color: C.muted, fontWeight: 700, textTransform: "uppercase", borderBottom: `1px solid ${C.border}` }}>{h}</th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {chs.length === 0 && <tr><td colSpan={6} style={{ padding: 40, textAlign: "center", color: C.muted }}>No channels yet</td></tr>}
+            {chs.map((c) => (
+              <tr key={c.id} data-testid={`channel-row-${c.id}`} style={{ borderBottom: `1px solid ${C.border}` }}>
+                <td style={dkTd}>
+                  <div style={{ fontWeight: 700 }}>{c.title}</div>
+                  {c.username && <div style={{ fontSize: 11, color: C.muted }}>@{c.username}</div>}
+                </td>
+                <td style={{ ...dkTd, fontFamily: "monospace", fontSize: 11 }}>{c.chat_id}</td>
+                <td style={dkTd}>{c.type || "—"}</td>
+                <td style={dkTd}>
+                  <span style={{ padding: "3px 8px", borderRadius: 5, fontSize: 10, fontWeight: 700, background: c.bot_status === "administrator" ? C.greenDim : C.amberDim, color: c.bot_status === "administrator" ? C.green : C.amber }}>
+                    {c.bot_status || "unknown"}
+                  </span>
+                </td>
+                <td style={dkTd}>
+                  <span style={{ padding: "3px 8px", borderRadius: 5, fontSize: 10, fontWeight: 700, background: c.enabled !== false ? C.greenDim : C.redDim, color: c.enabled !== false ? C.green : C.red }}>
+                    {c.enabled !== false ? "● Active" : "○ Disabled"}
+                  </span>
+                </td>
+                <td style={dkTd}>
+                  <div style={{ display: "flex", gap: 4 }}>
+                    <button data-testid={`ch-edit-${c.id}`} onClick={() => editTitle(c)} style={miniBtn(C.accent)}>✎</button>
+                    <button data-testid={`ch-toggle-${c.id}`} onClick={() => toggleEnabled(c)} style={miniBtn(C.amber)}>{c.enabled !== false ? "⏸" : "▶"}</button>
+                    <button data-testid={`ch-delete-${c.id}`} onClick={() => del(c)} style={miniBtn(C.red)}>✕</button>
+                  </div>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+// ─── shared styles ───────────────────────────────────────────
 function GeminiSettings({ showToast }) {
   const [cfg, setCfg] = useState({ api_key: "", model: "gemini-2.5-flash", enabled: false });
   const [hasKey, setHasKey] = useState(false);
