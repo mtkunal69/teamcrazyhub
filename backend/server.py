@@ -14,12 +14,16 @@ from datetime import datetime, timezone, timedelta
 from typing import List, Optional, Literal
 
 from fastapi import FastAPI, APIRouter, Depends, HTTPException, Header, Query
+from fastapi.responses import StreamingResponse
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel, Field, ConfigDict
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 import pytz
+import io
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 
 from telegram_service import (
     send_message as tg_send,
@@ -506,6 +510,166 @@ async def dashboard_stats(admin: dict = Depends(require_admin)):
 @api.get("/health")
 async def health():
     return {"status": "ok", "time": now_iso()}
+
+# ─────────────────────────────────────────────────────────────
+# Routes — Excel Export
+# ─────────────────────────────────────────────────────────────
+def _parse_iso(s: str) -> datetime:
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except Exception:
+        return datetime.now(timezone.utc)
+
+def _build_xlsx(reports: list, period_label: str, start_dt: datetime, end_dt: datetime) -> bytes:
+    wb = Workbook()
+    HDR_FILL = PatternFill("solid", fgColor="1D4ED8")
+    HDR_FONT = Font(bold=True, color="FFFFFF", size=11)
+    SUB_FILL = PatternFill("solid", fgColor="EFF6FF")
+    SUB_FONT = Font(bold=True, color="1D4ED8", size=11)
+    THIN = Side(border_style="thin", color="E2E8F0")
+    BORDER = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
+    CENTER = Alignment(horizontal="center", vertical="center")
+
+    # ── Sheet 1: Summary ──
+    ws = wb.active
+    ws.title = "Summary"
+    ws["A1"] = "TeamCrazy Hub · Weekly Salary Report"
+    ws["A1"].font = Font(bold=True, size=16, color="1D4ED8")
+    ws.merge_cells("A1:D1")
+    ws["A2"] = f"Period: {period_label}"
+    ws["A2"].font = Font(italic=True, color="64748B", size=10)
+    ws.merge_cells("A2:D2")
+
+    total_paid = sum(r.get("salary", 0) for r in reports)
+    verified = sum(1 for r in reports if r.get("status") == "VERIFIED")
+    mismatch = len(reports) - verified
+    unique_workers = len({r.get("telegram") for r in reports})
+
+    stats = [
+        ("Total Reports", len(reports)),
+        ("Unique Workers", unique_workers),
+        ("Verified", verified),
+        ("Mismatches", mismatch),
+        ("Total Salary Paid", f"\u20b9{total_paid:,}"),
+        ("Success Rate", f"{round(verified/max(len(reports),1)*100,1)}%"),
+    ]
+    ws["A4"] = "Metric"; ws["B4"] = "Value"
+    ws["A4"].fill = HDR_FILL; ws["A4"].font = HDR_FONT; ws["A4"].border = BORDER
+    ws["B4"].fill = HDR_FILL; ws["B4"].font = HDR_FONT; ws["B4"].border = BORDER
+    for i, (k, v) in enumerate(stats, 5):
+        ws[f"A{i}"] = k; ws[f"B{i}"] = v
+        ws[f"A{i}"].font = Font(bold=True); ws[f"A{i}"].border = BORDER
+        ws[f"B{i}"].border = BORDER
+
+    # By worker type
+    row = 12
+    ws[f"A{row}"] = "By Worker Type"
+    ws[f"A{row}"].font = SUB_FONT; ws[f"A{row}"].fill = SUB_FILL
+    ws.merge_cells(f"A{row}:D{row}")
+    row += 1
+    ws[f"A{row}"] = "Worker Type"; ws[f"B{row}"] = "Reports"; ws[f"C{row}"] = "Total Salary"
+    for c in ("A", "B", "C"):
+        cell = ws[f"{c}{row}"]; cell.fill = HDR_FILL; cell.font = HDR_FONT; cell.border = BORDER; cell.alignment = CENTER
+    row += 1
+    for wt in WORKER_TYPES:
+        rows_wt = [r for r in reports if r.get("worker_type") == wt]
+        ws[f"A{row}"] = wt
+        ws[f"B{row}"] = len(rows_wt)
+        ws[f"C{row}"] = f"\u20b9{sum(r.get('salary',0) for r in rows_wt):,}"
+        for c in ("A", "B", "C"):
+            ws[f"{c}{row}"].border = BORDER
+        row += 1
+
+    # ── Sheet 2: All Reports ──
+    ws2 = wb.create_sheet("All Reports")
+    headers = ["Date", "Name", "Telegram", "Worker Type", "Entered Count", "AI Count", "Slab", "Salary (\u20b9)", "Status"]
+    for col, h in enumerate(headers, 1):
+        cell = ws2.cell(row=1, column=col, value=h)
+        cell.fill = HDR_FILL; cell.font = HDR_FONT; cell.border = BORDER; cell.alignment = CENTER
+
+    sorted_reports = sorted(reports, key=lambda x: x.get("created_at", ""), reverse=True)
+    for ri, r in enumerate(sorted_reports, 2):
+        dt = _parse_iso(r.get("created_at", "")) + timedelta(hours=5, minutes=30)
+        vals = [
+            dt.strftime("%d %b %Y · %I:%M %p IST"),
+            r.get("name", ""),
+            r.get("telegram", ""),
+            r.get("worker_type", ""),
+            r.get("member_count", 0),
+            r.get("ai_count", 0),
+            r.get("slab_label") or "\u2014",
+            r.get("salary", 0),
+            r.get("status", ""),
+        ]
+        for ci, v in enumerate(vals, 1):
+            cell = ws2.cell(row=ri, column=ci, value=v)
+            cell.border = BORDER
+            if ci == 9:
+                cell.font = Font(bold=True, color=("047857" if v == "VERIFIED" else "B91C1C"))
+            if ci == 8:
+                cell.font = Font(bold=True, color="047857" if v > 0 else "94A3B8")
+
+    # ── Sheet 3: Per-Worker Breakdown ──
+    ws3 = wb.create_sheet("Worker Breakdown")
+    for col, h in enumerate(["Worker", "Telegram", "Reports", "Total Members", "Total Salary (\u20b9)", "Verified", "Mismatches"], 1):
+        cell = ws3.cell(row=1, column=col, value=h)
+        cell.fill = HDR_FILL; cell.font = HDR_FONT; cell.border = BORDER; cell.alignment = CENTER
+
+    by_user = {}
+    for r in reports:
+        k = r.get("telegram") or r.get("name") or "?"
+        d = by_user.setdefault(k, {"name": r.get("name", ""), "tg": r.get("telegram", ""),
+                                    "n": 0, "members": 0, "salary": 0, "v": 0, "m": 0})
+        d["n"] += 1
+        d["members"] += r.get("member_count", 0)
+        d["salary"] += r.get("salary", 0)
+        if r.get("status") == "VERIFIED": d["v"] += 1
+        else: d["m"] += 1
+
+    for ri, (_k, u) in enumerate(sorted(by_user.items(), key=lambda x: x[1]["salary"], reverse=True), 2):
+        vals = [u["name"], u["tg"], u["n"], u["members"], u["salary"], u["v"], u["m"]]
+        for ci, v in enumerate(vals, 1):
+            cell = ws3.cell(row=ri, column=ci, value=v)
+            cell.border = BORDER
+            if ci == 5:
+                cell.font = Font(bold=True, color="047857" if v > 0 else "94A3B8")
+
+    # Auto-size columns
+    for sheet in [ws, ws2, ws3]:
+        for col_cells in sheet.columns:
+            try:
+                col_letter = col_cells[0].column_letter
+                max_len = max(len(str(c.value or "")) for c in col_cells)
+                sheet.column_dimensions[col_letter].width = min(max_len + 4, 38)
+            except Exception:
+                pass
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf.getvalue()
+
+
+@api.get("/reports/export/weekly")
+async def export_weekly_xlsx(admin: dict = Depends(require_admin), days: int = 7):
+    end_dt = datetime.now(timezone.utc)
+    start_dt = end_dt - timedelta(days=days)
+    rows = await db.reports.find(
+        {"created_at": {"$gte": start_dt.isoformat()}},
+        {"_id": 0},
+    ).sort("created_at", -1).to_list(10000)
+
+    ist_now = datetime.now(IST)
+    ist_start = ist_now - timedelta(days=days)
+    period_label = f"{ist_start.strftime('%d %b %Y')} \u2192 {ist_now.strftime('%d %b %Y')}"
+    xlsx_bytes = _build_xlsx(rows, period_label, start_dt, end_dt)
+
+    filename = f"teamcrazy_weekly_report_{ist_now.strftime('%Y%m%d')}.xlsx"
+    return StreamingResponse(
+        io.BytesIO(xlsx_bytes),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 # ─────────────────────────────────────────────────────────────
 # Routes — Telegram Settings

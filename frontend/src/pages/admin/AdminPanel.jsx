@@ -214,6 +214,27 @@ function Reports() {
     a.click();
   }
 
+  async function exportWeeklyXLSX() {
+    try {
+      const token = localStorage.getItem("tch_token");
+      const res = await fetch(`${process.env.REACT_APP_BACKEND_URL}/api/reports/export/weekly?days=7`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (!res.ok) { alert("Export failed"); return; }
+      const blob = await res.blob();
+      const cd = res.headers.get("Content-Disposition") || "";
+      const m = /filename="?([^"]+)"?/.exec(cd);
+      const filename = m ? m[1] : `teamcrazy_weekly_${new Date().toISOString().slice(0,10)}.xlsx`;
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url; a.download = filename;
+      document.body.appendChild(a); a.click(); a.remove();
+      URL.revokeObjectURL(url);
+    } catch (e) {
+      alert("Download failed: " + e.message);
+    }
+  }
+
   return (
     <div>
       <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 20 }}>
@@ -221,7 +242,10 @@ function Reports() {
           <h1 style={{ fontSize: 28, fontWeight: 900, margin: "0 0 4px" }}>Staff Reports</h1>
           <p style={{ color: C.muted, fontSize: 13, margin: 0 }}>All salary submissions with AI verification results.</p>
         </div>
-        <button data-testid="export-csv-btn" onClick={exportCSV} style={{ ...btnGhost, color: C.accent, borderColor: C.accent + "40" }}>⬇ Export CSV</button>
+        <div style={{ display: "flex", gap: 8 }}>
+          <button data-testid="export-csv-btn" onClick={exportCSV} style={{ ...btnGhost, color: C.accent, borderColor: C.accent + "40" }}>⬇ Export CSV</button>
+          <button data-testid="export-weekly-xlsx-btn" onClick={exportWeeklyXLSX} style={{ ...btnGhost, color: C.green, borderColor: C.green + "40" }}>📊 Weekly Excel Report</button>
+        </div>
       </div>
 
       <div style={{ background: C.card, padding: 14, borderRadius: 10, border: `1px solid ${C.border}`, display: "grid", gridTemplateColumns: "2fr 1fr 1fr auto", gap: 10, marginBottom: 14 }}>
