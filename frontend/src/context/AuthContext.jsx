@@ -1,23 +1,20 @@
 import { createContext, useContext, useEffect, useState } from "react";
-import { api, getSession, setSession, clearSession } from "@/lib/api";
+import { getSession, setSession, clearSession, api } from "@/lib/api";
 
 const AuthCtx = createContext(null);
 
 export function AuthProvider({ children }) {
   const [user, setUser] = useState(() => getSession());
-  const [ready, setReady] = useState(false);
+  // Trust localStorage on mount — no /auth/me round-trip required.
+  // Individual protected requests will fail with 401 if token is bad,
+  // and clear the session at that point (handled in api.js interceptor).
+  const [ready] = useState(true);
 
+  // Listen for "auth:logout" event from interceptor (cross-component logout)
   useEffect(() => {
-    const s = getSession();
-    if (!s) {
-      setReady(true);
-      return;
-    }
-    api.get("/auth/me").then(() => setReady(true)).catch(() => {
-      clearSession();
-      setUser(null);
-      setReady(true);
-    });
+    const onLogout = () => setUser(null);
+    window.addEventListener("auth:logout", onLogout);
+    return () => window.removeEventListener("auth:logout", onLogout);
   }, []);
 
   const loginAdmin = async (username, password) => {

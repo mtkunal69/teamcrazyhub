@@ -31,6 +31,7 @@ from telegram_service import (
     build_daily_summary,
     get_config as tg_get_config,
 )
+import httpx
 
 # ─────────────────────────────────────────────────────────────
 # Config & DB
@@ -372,26 +373,43 @@ SAMPLE_NAMES = [
 
 @api.post("/ai/count")
 async def ai_count(body: AICountIn, _: dict = Depends(require_user)):
-    """Simulated AI vision: pretends to count members from screen recording."""
+    """Simulated AI vision: scans 'video' and produces its own member count.
+    Behavior:
+      - 25% chance: AI detects significantly different count → MISMATCH
+      - 75% chance: AI count within ±2 of entered → VERIFIED
+    """
     entered = body.entered_count
-    total_visible = entered + random.randint(0, 3)
-    premium_count = int(total_visible * (0.18 + random.random() * 0.10))
+    roll = random.random()
+    if roll < 0.25:
+        # Mismatch case — AI sees noticeably different count
+        delta_pct = random.uniform(0.15, 0.40)
+        sign = 1 if random.random() > 0.5 else -1
+        ai_n = max(0, int(entered * (1 + sign * delta_pct)))
+        if ai_n == entered:  # ensure actual mismatch
+            ai_n = max(0, entered + (5 * sign))
+    else:
+        # Verified case — small variance
+        ai_n = max(0, entered + random.randint(-2, 2))
+
+    # Detect "premium" members for display
+    total_visible = ai_n
+    premium_count = max(0, int(total_visible * (0.15 + random.random() * 0.15)))
     members = []
-    premium_idx = set(random.sample(range(total_visible), min(premium_count, total_visible)))
-    for i in range(total_visible):
-        is_premium = i in premium_idx
-        members.append({
-            "name": random.choice(SAMPLE_NAMES),
-            "premium": is_premium,
-            "badge": ("\u2b50 Premium" if random.random() > 0.5 else "\U0001f381 Gift Badge") if is_premium else None,
-        })
-    ai_n = total_visible
+    if total_visible > 0:
+        premium_idx = set(random.sample(range(total_visible), min(premium_count, total_visible)))
+        for i in range(total_visible):
+            is_premium = i in premium_idx
+            members.append({
+                "name": random.choice(SAMPLE_NAMES),
+                "premium": is_premium,
+                "badge": ("\u2b50 Premium" if random.random() > 0.5 else "\U0001f381 Gift Badge") if is_premium else None,
+            })
+
     matched = abs(ai_n - entered) <= 3
-    final_count = entered if matched else ai_n
     return {
         "total_visible": total_visible,
         "premium_count": premium_count,
-        "ai_count": final_count,
+        "ai_count": ai_n,
         "matched": matched,
         "members": members[:15],
     }
@@ -714,12 +732,39 @@ async def set_tg_settings(body: TelegramSettings, admin: dict = Depends(require_
 
 @api.post("/settings/telegram/test")
 async def test_tg(admin: dict = Depends(require_admin)):
-    res = await tg_send(db,
-        "✅ <b>TeamCrazy Hub</b> — test message\n"
+    """Test message — bypasses the 'enabled' flag so admin can verify creds before going live."""
+    cfg = await db.settings.find_one({"key": "telegram"}, {"_id": 0})
+    if not cfg:
+        return {"ok": False, "error": "Save bot token + chat ID first"}
+    token = (cfg.get("bot_token") or "").strip()
+    chat_id = (cfg.get("chat_id") or "").strip()
+    if not token:
+        return {"ok": False, "error": "Bot token is missing"}
+    if not chat_id:
+        return {"ok": False, "error": "Chat ID is missing"}
+    text = (
+        "\u2705 <b>TeamCrazy Hub</b> \u2014 test message\n"
         "Your Telegram bot is connected and working.\n"
-        f"Sent by: <b>{admin['name']}</b> · {now_iso()[:19]} UTC"
+        f"Sent by: <b>{admin['name']}</b> \u00b7 {now_iso()[:19]} UTC"
     )
-    return res
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    try:
+        async with httpx.AsyncClient(timeout=20) as client_tg:
+            r = await client_tg.post(url, json={
+                "chat_id": chat_id,
+                "text": text,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True,
+            })
+            data = r.json()
+            if not data.get("ok"):
+                desc = data.get("description", "Unknown error from Telegram")
+                return {"ok": False, "error": f"Telegram API: {desc}"}
+            return {"ok": True, "message_id": data.get("result", {}).get("message_id")}
+    except httpx.TimeoutException:
+        return {"ok": False, "error": "Telegram API timeout — check VPS internet"}
+    except Exception as e:
+        return {"ok": False, "error": f"Network error: {str(e)[:120]}"}
 
 @api.post("/settings/telegram/send-daily-now")
 async def send_daily_now(admin: dict = Depends(require_admin)):

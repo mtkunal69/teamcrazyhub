@@ -41,7 +41,7 @@ export default function AdminPanel() {
   const pageTitle = NAV.find((n) => n.id === page)?.label || "";
 
   return (
-    <div style={{ display: "flex", minHeight: "100vh", background: C.bg, color: C.text, fontFamily: "'JetBrains Mono','Plus Jakarta Sans',monospace" }}>
+    <div style={{ display: "flex", minHeight: "100vh", background: C.bg, color: C.text, fontFamily: "'Plus Jakarta Sans',-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif" }}>
       {/* Sidebar */}
       <aside style={{ width: sideOpen ? 240 : 70, background: C.surface, borderRight: `1px solid ${C.border}`, transition: "width .2s", display: "flex", flexDirection: "column" }}>
         <div style={{ padding: "20px 16px", display: "flex", alignItems: "center", gap: 11, borderBottom: `1px solid ${C.border}` }}>
