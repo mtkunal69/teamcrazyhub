@@ -13,7 +13,7 @@ import logging
 from datetime import datetime, timezone, timedelta
 from typing import List, Optional, Literal
 
-from fastapi import FastAPI, APIRouter, Depends, HTTPException, Header, Query
+from fastapi import FastAPI, APIRouter, Depends, HTTPException, Header, Query, UploadFile, File, Form
 from fastapi.responses import StreamingResponse
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -22,6 +22,8 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 import pytz
 import io
+import tempfile
+import shutil
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 
@@ -32,6 +34,11 @@ from telegram_service import (
     get_config as tg_get_config,
 )
 import httpx
+from gemini_service import (
+    analyze_video as gemini_analyze,
+    test_api_key as gemini_test_key,
+    get_gemini_config,
+)
 
 # ─────────────────────────────────────────────────────────────
 # Config & DB
@@ -148,6 +155,11 @@ class TelegramSettings(BaseModel):
     enabled: bool = False
     notify_on_report: bool = True
     daily_summary: bool = True
+
+class GeminiSettings(BaseModel):
+    api_key: str = ""
+    model: str = "gemini-2.5-flash"
+    enabled: bool = False
 
 # ─────────────────────────────────────────────────────────────
 # Seed defaults
@@ -415,41 +427,125 @@ async def ai_count(body: AICountIn, _: dict = Depends(require_user)):
     }
 
 @api.post("/reports")
-async def submit_report(body: ReportIn, p: dict = Depends(require_user)):
-    if body.worker_type not in WORKER_TYPES:
+async def submit_report(
+    p: dict = Depends(require_user),
+    worker_type: str = Form(...),
+    member_count: int = Form(...),
+    video: UploadFile = File(...),
+):
+    """Real AI-powered report submission:
+    1. Save uploaded video to temp file
+    2. Run Gemini Flash video analysis (if configured) — deterministic count
+    3. Compare AI count vs entered count → VERIFIED / MISMATCH
+    4. Calculate salary from AI count + salary slabs
+    5. Send instant Telegram notification (if enabled)
+    """
+    if worker_type not in WORKER_TYPES:
         raise HTTPException(400, "Invalid worker type")
-    # Run AI count
-    ai_res = await ai_count(AICountIn(entered_count=body.member_count, worker_type=body.worker_type), p)
-    salary, slab = await calc_salary(body.worker_type, ai_res["ai_count"])
-    status = "VERIFIED" if ai_res["matched"] else "MISMATCH COUNTING"
-    user = await db.users.find_one({"id": p["sub"]}, {"_id": 0})
-    doc = {
-        "id": str(uuid.uuid4()),
-        "user_id": p["sub"],
-        "name": user["name"] if user else p["name"],
-        "telegram": user["telegram"] if user else "",
-        "worker_type": body.worker_type,
-        "member_count": body.member_count,
-        "ai_count": ai_res["ai_count"],
-        "salary": salary,
-        "status": status,
-        "slab_label": slab,
-        "video_filename": body.video_filename,
-        "video_proof": bool(body.video_filename),
-        "members_detected": ai_res["members"],
-        "created_at": now_iso(),
-    }
-    await db.reports.insert_one(doc)
-    doc.pop("_id", None)
 
-    # Fire Telegram notification (non-blocking failure)
+    # Save video to temp file
+    suffix = os.path.splitext(video.filename or "video.mp4")[1] or ".mp4"
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
     try:
-        cfg = await tg_get_config(db)
-        if cfg and cfg.get("enabled") and cfg.get("notify_on_report", True):
-            await tg_send(db, build_report_notification(doc))
-    except Exception as e:
-        log.warning(f"TG notify failed: {e}")
-    return doc
+        shutil.copyfileobj(video.file, tmp)
+        tmp.close()
+        video_path = tmp.name
+        video_size = os.path.getsize(video_path)
+        log.info(f"Received video: {video.filename} ({video_size/1024/1024:.1f} MB)")
+
+        # Try real Gemini AI first
+        ai_count_val = None
+        premium = 0
+        members_detected = []
+        confidence = "medium"
+        ai_source = "MOCK"
+        ai_error = None
+
+        gem_cfg = await get_gemini_config(db)
+        if gem_cfg and gem_cfg.get("enabled") and gem_cfg.get("api_key"):
+            result = await gemini_analyze(
+                gem_cfg["api_key"], video_path,
+                model=gem_cfg.get("model", "gemini-2.5-flash"),
+            )
+            if result.get("ok"):
+                ai_count_val = result["count"]
+                premium = result.get("premium_count", 0)
+                confidence = result.get("confidence", "medium")
+                ai_source = "GEMINI"
+                names = result.get("sample_names", []) or SAMPLE_NAMES[:8]
+                for i, nm in enumerate(names[:15]):
+                    members_detected.append({
+                        "name": nm,
+                        "premium": i < premium,
+                        "badge": "\u2b50 Premium" if i < premium else None,
+                    })
+            else:
+                ai_error = result.get("error", "Gemini failed")
+                log.warning(f"Gemini analysis failed: {ai_error}")
+
+        # Fallback to mock if Gemini not configured/failed
+        if ai_count_val is None:
+            roll = random.random()
+            if roll < 0.25:
+                delta_pct = random.uniform(0.15, 0.40)
+                sign = 1 if random.random() > 0.5 else -1
+                ai_count_val = max(0, int(member_count * (1 + sign * delta_pct)))
+                if ai_count_val == member_count:
+                    ai_count_val = max(0, member_count + (5 * sign))
+            else:
+                ai_count_val = max(0, member_count + random.randint(-2, 2))
+            premium = max(0, int(ai_count_val * 0.2))
+            for i in range(min(15, ai_count_val)):
+                members_detected.append({
+                    "name": random.choice(SAMPLE_NAMES),
+                    "premium": i < premium,
+                    "badge": "\u2b50 Premium" if i < premium else None,
+                })
+
+        matched = abs(ai_count_val - member_count) <= 3
+        status = "VERIFIED" if matched else "MISMATCH COUNTING"
+        salary, slab = await calc_salary(worker_type, ai_count_val)
+
+        user = await db.users.find_one({"id": p["sub"]}, {"_id": 0})
+        doc = {
+            "id": str(uuid.uuid4()),
+            "user_id": p["sub"],
+            "name": user["name"] if user else p["name"],
+            "telegram": user["telegram"] if user else "",
+            "worker_type": worker_type,
+            "member_count": member_count,
+            "ai_count": ai_count_val,
+            "ai_source": ai_source,
+            "ai_confidence": confidence,
+            "ai_error": ai_error,
+            "premium_count": premium,
+            "salary": salary,
+            "status": status,
+            "slab_label": slab,
+            "video_filename": video.filename,
+            "video_size_mb": round(video_size / 1024 / 1024, 2),
+            "video_proof": True,
+            "members_detected": members_detected,
+            "created_at": now_iso(),
+        }
+        await db.reports.insert_one(doc)
+        doc.pop("_id", None)
+
+        # Fire Telegram notification (non-blocking failure)
+        try:
+            cfg = await tg_get_config(db)
+            if cfg and cfg.get("enabled") and cfg.get("notify_on_report", True):
+                await tg_send(db, build_report_notification(doc))
+        except Exception as e:
+            log.warning(f"TG notify failed: {e}")
+
+        return doc
+    finally:
+        # Cleanup temp file
+        try:
+            os.unlink(tmp.name)
+        except Exception:
+            pass
 
 @api.get("/reports")
 async def list_reports(
@@ -771,6 +867,37 @@ async def send_daily_now(admin: dict = Depends(require_admin)):
     """Manually trigger today's summary (useful for testing)."""
     await run_daily_summary_job(force=True)
     return {"ok": True}
+
+# ─────────────────────────────────────────────────────────────
+# Routes — Gemini AI Settings
+# ─────────────────────────────────────────────────────────────
+@api.get("/settings/gemini")
+async def get_gemini_settings(admin: dict = Depends(require_admin)):
+    cfg = await db.settings.find_one({"key": "gemini"}, {"_id": 0})
+    if not cfg:
+        return {"api_key": "", "model": "gemini-2.5-flash", "enabled": False}
+    cfg.pop("key", None)
+    # Mask API key in response (show last 4)
+    k = cfg.get("api_key", "")
+    if k and len(k) > 8:
+        cfg["api_key_masked"] = "***" + k[-4:]
+    return cfg
+
+@api.put("/settings/gemini")
+async def set_gemini_settings(body: GeminiSettings, admin: dict = Depends(require_admin)):
+    doc = body.model_dump()
+    doc["key"] = "gemini"
+    doc["updated_at"] = now_iso()
+    doc["updated_by"] = admin["name"]
+    await db.settings.update_one({"key": "gemini"}, {"$set": doc}, upsert=True)
+    return {"ok": True}
+
+@api.post("/settings/gemini/test")
+async def test_gemini(admin: dict = Depends(require_admin)):
+    cfg = await db.settings.find_one({"key": "gemini"}, {"_id": 0})
+    if not cfg:
+        return {"ok": False, "error": "Save API key first"}
+    return await gemini_test_key(cfg.get("api_key", ""))
 
 # ─────────────────────────────────────────────────────────────
 # Daily summary scheduler (12 PM IST)

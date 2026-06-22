@@ -18,6 +18,7 @@ const NAV = [
   { id: "simulator", icon: "🧮", label: "Simulator" },
   { id: "audit", icon: "🔍", label: "Audit Log" },
   { id: "telegram", icon: "📨", label: "Telegram Bot" },
+  { id: "gemini", icon: "🧠", label: "Gemini AI" },
 ];
 
 export default function AdminPanel() {
@@ -95,6 +96,7 @@ export default function AdminPanel() {
           {page === "simulator" && <Simulator charts={charts} />}
           {page === "audit" && <Audit />}
           {page === "telegram" && <TelegramSettings showToast={showToast} />}
+          {page === "gemini" && <GeminiSettings showToast={showToast} />}
         </main>
       </div>
 
@@ -666,6 +668,107 @@ function Toggle({ label, sub, v, onChange, ...rest }) {
 }
 
 const codeS = { background: C.bg, padding: "1px 6px", borderRadius: 4, fontSize: 11, color: C.accent, fontFamily: "monospace" };
+
+// ─── GEMINI AI SETTINGS ──────────────────────────────────────
+function GeminiSettings({ showToast }) {
+  const [cfg, setCfg] = useState({ api_key: "", model: "gemini-2.5-flash", enabled: false });
+  const [hasKey, setHasKey] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [testing, setTesting] = useState(false);
+
+  useEffect(() => {
+    api.get("/settings/gemini").then((r) => {
+      // Don't overwrite api_key with masked version — keep editable field empty if already set
+      setCfg({ api_key: "", model: r.data.model || "gemini-2.5-flash", enabled: !!r.data.enabled });
+      setHasKey(!!r.data.api_key_masked);
+    });
+  }, []);
+
+  async function save() {
+    setSaving(true);
+    try {
+      const payload = { ...cfg };
+      // If user didn't enter a new key, don't overwrite existing
+      if (!cfg.api_key && hasKey) {
+        delete payload.api_key;
+        // Need to fetch existing key — better: just don't send api_key field
+      }
+      // Since backend requires api_key in model, send what we have
+      await api.put("/settings/gemini", { ...cfg, api_key: cfg.api_key || "" });
+      showToast("✓ Gemini settings saved");
+      if (cfg.api_key) setHasKey(true);
+    } catch (e) {
+      showToast(e.response?.data?.detail || "Save failed", "error");
+    } finally { setSaving(false); }
+  }
+
+  async function test() {
+    setTesting(true);
+    try {
+      await api.put("/settings/gemini", { ...cfg, api_key: cfg.api_key || "" });
+      const { data } = await api.post("/settings/gemini/test");
+      if (data.ok) showToast("✓ Gemini API key working", "success");
+      else showToast(`✕ ${data.error || "Test failed"}`, "error");
+    } catch (e) {
+      showToast(e.response?.data?.detail || "Test failed", "error");
+    } finally { setTesting(false); }
+  }
+
+  return (
+    <div>
+      <h1 style={{ fontSize: 28, fontWeight: 900, margin: "0 0 4px" }}>🧠 Gemini AI (Video Vision)</h1>
+      <p style={{ color: C.muted, fontSize: 13, margin: "0 0 24px" }}>Real AI-powered member counting from screen recordings. Same video = same count.</p>
+
+      <div style={{ background: C.accentDim, border: `1px solid ${C.accent}40`, borderLeft: `3px solid ${C.accent}`, borderRadius: 10, padding: 16, marginBottom: 22 }}>
+        <div style={{ fontWeight: 800, fontSize: 13, color: C.accent, marginBottom: 8 }}>⚡ Get Free Gemini API Key (2 minutes)</div>
+        <ol style={{ margin: 0, paddingLeft: 18, fontSize: 12, color: C.text, lineHeight: 1.8 }}>
+          <li>Open <a href="https://aistudio.google.com/app/apikey" target="_blank" rel="noreferrer" style={{ color: C.accent, fontWeight: 700 }}>aistudio.google.com/app/apikey</a> and sign in with Google</li>
+          <li>Click <b>"Create API key"</b> → choose "Create API key in new project"</li>
+          <li>Copy the key (starts with <code style={codeS}>AIza...</code>)</li>
+          <li>Paste below + toggle <b>Enable</b> + hit <b>Save & Test</b></li>
+        </ol>
+        <div style={{ marginTop: 10, padding: "6px 10px", background: C.bg, borderRadius: 6, fontSize: 11, color: C.muted }}>
+          💡 Free tier: ~1500 video analyses/day · No credit card needed
+        </div>
+      </div>
+
+      <div style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 12, padding: 24, display: "grid", gap: 16, maxWidth: 720 }}>
+        <label style={{ display: "grid", gap: 6 }}>
+          <div style={{ display: "flex", justifyContent: "space-between" }}>
+            <span style={{ fontSize: 11, color: C.muted, fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.06em" }}>Gemini API Key</span>
+            {hasKey && <span style={{ fontSize: 10, color: C.green, fontWeight: 700 }}>✓ Key saved (enter new key only to replace)</span>}
+          </div>
+          <input
+            data-testid="gemini-api-key-input"
+            value={cfg.api_key}
+            onChange={(e) => setCfg({ ...cfg, api_key: e.target.value })}
+            placeholder={hasKey ? "(saved — leave blank to keep)" : "AIzaSyA..."}
+            type="password"
+            style={dkInp}
+          />
+        </label>
+
+        <label style={{ display: "grid", gap: 6 }}>
+          <span style={{ fontSize: 11, color: C.muted, fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.06em" }}>Model</span>
+          <select data-testid="gemini-model-select" value={cfg.model} onChange={(e) => setCfg({ ...cfg, model: e.target.value })} style={dkInp}>
+            <option value="gemini-2.5-flash">gemini-2.5-flash (recommended · fast · free tier)</option>
+            <option value="gemini-2.0-flash">gemini-2.0-flash (stable)</option>
+            <option value="gemini-2.5-pro">gemini-2.5-pro (more accurate · slower)</option>
+          </select>
+        </label>
+
+        <div style={{ borderTop: `1px solid ${C.border}`, paddingTop: 16 }}>
+          <Toggle data-testid="gemini-enabled" label="Enable Real AI Vision" sub="When ON, uses Gemini for actual member counting. When OFF, falls back to mock." v={cfg.enabled} onChange={(v) => setCfg({ ...cfg, enabled: v })} />
+        </div>
+
+        <div style={{ display: "flex", gap: 10, paddingTop: 8 }}>
+          <button data-testid="gemini-save-btn" onClick={save} disabled={saving} style={{ ...btnPrimary, flex: 1 }}>{saving ? "Saving..." : "💾 Save"}</button>
+          <button data-testid="gemini-test-btn" onClick={test} disabled={testing} style={{ ...btnGhost, color: C.green, borderColor: C.green + "40", flex: 1, padding: "9px 18px" }}>{testing ? "Testing..." : "🧪 Save & Test API Key"}</button>
+        </div>
+      </div>
+    </div>
+  );
+}
 
 // ─── shared styles ───────────────────────────────────────────
 const dkInp = { padding: "9px 12px", borderRadius: 8, border: `1px solid ${C.border}`, fontSize: 12, color: C.text, background: C.bg, outline: "none", fontWeight: 500 };

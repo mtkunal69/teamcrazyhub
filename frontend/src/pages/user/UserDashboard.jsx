@@ -62,35 +62,47 @@ export default function UserDashboard() {
 function SubmitTab({ charts, onSubmitted }) {
   const [wt, setWt] = useState(WORKER_TYPES[0]);
   const [count, setCount] = useState("");
-  const [filename, setFilename] = useState("");
+  const [file, setFile] = useState(null);
   const [submitting, setSubmitting] = useState(false);
   const [result, setResult] = useState(null);
   const [err, setErr] = useState("");
+  const [stage, setStage] = useState("");
 
-  const fileRef = (e) => {
+  const onFile = (e) => {
     const f = e.target.files?.[0];
-    if (f) setFilename(f.name);
+    if (!f) return;
+    if (f.size > 50 * 1024 * 1024) { setErr("Video too large — max 50 MB"); return; }
+    setFile(f);
+    setErr("");
   };
 
   async function submit() {
     setErr("");
     const n = parseInt(count);
     if (isNaN(n) || n < 0) { setErr("Enter a valid member count"); return; }
-    if (!filename) { setErr("Please upload a screen recording proof"); return; }
+    if (!file) { setErr("Please upload a screen recording proof"); return; }
     setSubmitting(true);
     setResult(null);
+    setStage("📤 Uploading video to AI...");
     try {
-      // Simulate AI processing delay for UX
-      await new Promise((r) => setTimeout(r, 2200));
-      const { data } = await api.post("/reports", {
-        worker_type: wt, member_count: n, video_filename: filename,
+      const fd = new FormData();
+      fd.append("worker_type", wt);
+      fd.append("member_count", String(n));
+      fd.append("video", file);
+      setStage("🧠 AI is analyzing video — counting members (this may take 30-60 sec)...");
+      const { data } = await api.post("/reports", fd, {
+        headers: { "Content-Type": "multipart/form-data" },
+        timeout: 240000,
       });
       setResult(data);
       onSubmitted();
+      setFile(null);
+      setCount("");
     } catch (e) {
-      setErr(e.response?.data?.detail || "Submission failed");
+      setErr(e.response?.data?.detail || e.message || "Submission failed");
     } finally {
       setSubmitting(false);
+      setStage("");
     }
   }
 
@@ -99,7 +111,6 @@ function SubmitTab({ charts, onSubmitted }) {
 
   return (
     <div style={{ display: "grid", gridTemplateColumns: "1.2fr 1fr", gap: 22 }}>
-      {/* Form */}
       <div style={{ background: "#fff", borderRadius: 14, padding: 26, border: "1px solid #e2e8f0" }}>
         <h2 style={{ fontSize: 22, fontWeight: 800, margin: "0 0 6px" }}>Submit Daily Work</h2>
         <p style={{ fontSize: 13, color: "#64748b", margin: "0 0 22px" }}>AI will verify your screen recording and compute salary instantly.</p>
@@ -116,17 +127,18 @@ function SubmitTab({ charts, onSubmitted }) {
             <input data-testid="submit-member-count" type="number" min="0" value={count} onChange={(e) => setCount(e.target.value)} placeholder="e.g. 85" style={inp} />
           </label>
           <label style={lbl}>
-            <span>Screen Recording (MP4 / MOV / AVI)</span>
+            <span>Screen Recording (MP4 / MOV / AVI · max 50 MB)</span>
             <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-              <label style={{ flex: 1, padding: "11px 14px", borderRadius: 10, border: "1.5px dashed #cbd5e1", textAlign: "center", cursor: "pointer", background: "#f8fafc", color: filename ? "#0f172a" : "#94a3b8", fontWeight: 600, fontSize: 13 }}>
-                {filename || "📂 Click to choose video..."}
-                <input data-testid="submit-video-input" type="file" accept="video/*" onChange={fileRef} style={{ display: "none" }} />
+              <label style={{ flex: 1, padding: "11px 14px", borderRadius: 10, border: "1.5px dashed #cbd5e1", textAlign: "center", cursor: "pointer", background: "#f8fafc", color: file ? "#0f172a" : "#94a3b8", fontWeight: 600, fontSize: 13 }}>
+                {file ? `📹 ${file.name} (${(file.size/1024/1024).toFixed(1)} MB)` : "📂 Click to choose video..."}
+                <input data-testid="submit-video-input" type="file" accept="video/*" onChange={onFile} style={{ display: "none" }} />
               </label>
             </div>
           </label>
           {err && <div data-testid="submit-error" style={{ padding: "10px 12px", borderRadius: 9, background: "#fef2f2", color: "#b91c1c", fontSize: 13, fontWeight: 600, border: "1px solid #fecaca" }}>{err}</div>}
+          {stage && <div data-testid="submit-stage" style={{ padding: "10px 12px", borderRadius: 9, background: "#eff6ff", color: "#1d4ed8", fontSize: 13, fontWeight: 600, border: "1px solid #bfdbfe" }}>{stage}</div>}
           <button data-testid="submit-work-btn" disabled={submitting} onClick={submit} style={{ ...btnPrimary, opacity: submitting ? 0.7 : 1 }}>
-            {submitting ? "🧠 AI Verifying..." : "Verify & Submit →"}
+            {submitting ? "Processing..." : "Verify & Submit →"}
           </button>
         </div>
 
@@ -144,11 +156,16 @@ function SubmitTab({ charts, onSubmitted }) {
               <Stat label="Slab" value={result.slab_label || "—"} />
               <Stat label="Salary" value={fmtRupee(result.salary)} highlight />
             </div>
+            <div style={{ fontSize: 11, color: "#64748b", padding: "8px 10px", background: "rgba(255,255,255,0.6)", borderRadius: 6, fontWeight: 600 }}>
+              {result.ai_source === "GEMINI"
+                ? `🧠 Real AI (Gemini Flash) · confidence: ${result.ai_confidence}`
+                : "🎲 Mock AI (configure Gemini in admin for real vision)"}
+              {result.ai_error && ` · ⚠ ${result.ai_error}`}
+            </div>
           </div>
         )}
       </div>
 
-      {/* Live Salary Chart preview */}
       <div style={{ background: "#fff", borderRadius: 14, padding: 26, border: "1px solid #e2e8f0", height: "fit-content" }}>
         <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
           <div style={{ width: 8, height: 8, borderRadius: "50%", background: "#10b981" }} />
